@@ -26,11 +26,12 @@ def find_closest_column(target_sequence, tensor):
 
 
 class ImageGraphDataset(Dataset):
-    def __init__(self, data_infor_path, graph_path, adj_matrix, transform=None):
+    def __init__(self, data_infor_path, graph_path, adj_matrix, transform=None, root_path='./ST_Breast'):
         self.data_list = np.load(data_infor_path, allow_pickle=True).tolist()
-        self.graph = torch.load(graph_path)
+        self.graph = torch.load(graph_path, weights_only=False)
         self.transform = transform
         self.name = data_infor_path.split('/')[-1][:-4]
+        self.root_path = root_path
 
         self.layer_512 = self.graph['layer_512'].y
         self.layer_1024 = self.graph['layer_1024'].y
@@ -55,8 +56,8 @@ class ImageGraphDataset(Dataset):
         # img_dir = './HER2'
         # image_path = os.path.join(img_dir, self.data_list[idx]['img_path'])
 
-        img_dir = './ST_Breast/cropped_imgs/patch_224'
-        image_path = os.path.join(img_dir, self.name, self.data_list[idx]['img_path'].split('/')[-2] + '/' +
+        img_dir = os.path.join(self.root_path, 'cropped_imgs/patch_224')
+        image_path = os.path.join(img_dir, self.data_list[idx]['img_path'].split('/')[-2] + '/' +
                                   self.data_list[idx]['img_path'].split('/')[-1])
 
         image = Image.open(image_path).convert('RGB')
@@ -74,9 +75,10 @@ class ImageGraphDataset(Dataset):
         img_name = self.data_list[idx]['img_path'].split('/')
 
         """ """
-        # column_name = f'{img_name[2][:2]}_{img_name[3][:-4]}'
 
-        column_name = f'{img_name[2][:2]}__{img_name[3][:-4]}'
+        #column_name = f'{img_name[2][:2]}__{img_name[3][:-4]}'
+        column_name = f'{img_name[2][:2]}_{img_name[3][:-4]}'
+
 
         idx_matrix = self.adj_matrix.columns.get_loc(column_name)
         level = self.data_list[idx]['level']
@@ -186,7 +188,7 @@ def collate_fn_result(batch, adj_matrix, graph, is_weighted=False):
     return images, eval_label, adj_sub, adj_propagate, positions, idx_1024, idx_512, features_1024, features_512, graph, known_label, indices, level
 
 
-def create_dataloaders_for_train_file(npy_file_paths, batch_size=32, transform=None):
+def create_dataloaders_for_train_file(npy_file_paths, batch_size=32, transform=None, root_path='./ST_Breast_3D'):
 
     dataloaders = {}
 
@@ -195,10 +197,10 @@ def create_dataloaders_for_train_file(npy_file_paths, batch_size=32, transform=N
         # graph_path = f"./HER2_3D/3D_graph_data/{name}.pt"
         # adj_matrix_path = f'./HER2_3D/3D_combined_information/{name}.csv'
 
-        graph_path = f'./ST_Breast_3D/3D_graph_data/{name}.pt'
-        adj_matrix_path = f'./ST_Breast_3D/3D_combined_information/{name}.csv'
+        graph_path = os.path.join(root_path, f'3D_graph_data/{name}.pt')
+        adj_matrix_path = os.path.join(root_path, f'3D_combined_information/{name}.csv')
 
-        dataset = ImageGraphDataset(npy_file, graph_path, adj_matrix_path, transform=transform)
+        dataset = ImageGraphDataset(npy_file, graph_path, adj_matrix_path, transform=transform, root_path=root_path)
         adj_matrix_df = dataset.adj_matrix
         graph_data = dataset.graph
 
@@ -211,7 +213,7 @@ def create_dataloaders_for_train_file(npy_file_paths, batch_size=32, transform=N
     return dataloaders
 
 
-def create_dataloaders_for_result_file(npy_file_paths, batch_size=32, transform=None):
+def create_dataloaders_for_result_file(npy_file_paths, batch_size=32, transform=None, root_path='./ST_Breast_3D'):
     dataloaders = {}
     testloader = {}
     for npy_file in npy_file_paths:
@@ -219,10 +221,10 @@ def create_dataloaders_for_result_file(npy_file_paths, batch_size=32, transform=
         # graph_path = f"./HER2_3D/3D_graph_data/{name}.pt"
         # adj_matrix_path = f'./HER2_3D/3D_combined_information/{name}.csv'
 
-        graph_path = f'./ST_Breast_3D/3D_graph_data/{name}.pt'
-        adj_matrix_path = f'./ST_Breast_3D/3D_combined_information/{name}.csv'
+        graph_path = os.path.join(root_path, f'3D_graph_data/{name}.pt')
+        adj_matrix_path = os.path.join(root_path, f'3D_combined_information/{name}.csv')
 
-        dataset = ImageGraphDataset(npy_file, graph_path, adj_matrix_path, transform=transform)
+        dataset = ImageGraphDataset(npy_file, graph_path, adj_matrix_path, transform=transform, root_path=root_path)
         adj_matrix_df = dataset.adj_matrix
         graph_data = dataset.graph
 

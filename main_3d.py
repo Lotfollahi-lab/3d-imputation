@@ -105,9 +105,9 @@ if __name__ == "__main__":
         print(train_labels_path, val_labels_path)
 
         train_dataloaders = create_dataloaders_for_train_file(train_labels_path, batch_size=128,
-                                                              transform=img_transform)
+                                                              transform=img_transform, root_path=args.root_path)
         part_trainloader, test_dataloader = create_dataloaders_for_result_file(val_labels_path, batch_size=128,
-                                                                             transform=img_transform)
+                                                                             transform=img_transform, root_path=args.root_path)
         train_dataloaders.update(part_trainloader)
 
     # # Here is cross validation code for HER2
