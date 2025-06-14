@@ -1,6 +1,7 @@
 from PIL import Image
 import os
 import pandas as pd
+import argparse
 
 """
 Step 2: patch cropping for region/global level patches.
@@ -73,9 +74,18 @@ def generate_patches(image_path, output_dir, patch_size, output_csv_dir):
     print(f"CSV file saved: {csv_file}")
 
 
-def batch_process_images(image_dir, output_dir_1024, output_dir_512, csv_dir_1024, csv_dir_512):
-    # Get paths of all PNG images
-    image_paths = [os.path.join(image_dir, f) for f in os.listdir(image_dir) if f.endswith('.png')]
+def batch_process_images(image_path, output_dir_1024, output_dir_512, csv_dir_1024, csv_dir_512):
+    # Get paths of all PNG and JPG images
+    image_paths = [image_path]
+    #for f in os.listdir(image_dir):
+    #    if f.lower().endswith(('.png', '.jpg', '.jpeg')):
+    #        image_paths.append(os.path.join(image_dir, f))
+
+    # Create output directories recursively
+    os.makedirs(output_dir_1024, exist_ok=True)
+    os.makedirs(output_dir_512, exist_ok=True)
+    os.makedirs(csv_dir_1024, exist_ok=True)
+    os.makedirs(csv_dir_512, exist_ok=True)
 
     for image_path in image_paths:
         print(f"Processing image: {image_path}")
@@ -87,32 +97,24 @@ def batch_process_images(image_dir, output_dir_1024, output_dir_512, csv_dir_102
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--root_path', type=str, default='./ST_Breast',
+                        help='Root path for the dataset')
+    args = parser.parse_args()
+
     # Input folder path where WSI images are located
-    images = "./ST_Breast/imgs"
+    images = os.path.join(args.root_path, "images/HE/")
 
     # Output folder paths for patches
-    output_dir_1024_root = "./ST_Breast/cropped_imgs/patches_1024"
-    output_dir_512_root = "./ST_Breast/cropped_imgs/patches_512"
+    output_dir_1024_root = os.path.join(args.root_path, "cropped_imgs/patches_1024")
+    output_dir_512_root = os.path.join(args.root_path, "cropped_imgs/patches_512")
 
     # Output folder paths for CSV files (to store patch info for each image)
-    csv_dir_1024_root = "./ST_Breast/patches_csv/patches_1024"
-    csv_dir_512_root = "./ST_Breast/patches_csv/patches_512"
+    csv_dir_1024_root = os.path.join(args.root_path, "patches_csv/patches_1024")
+    csv_dir_512_root = os.path.join(args.root_path, "patches_csv/patches_512")
 
     for sample in os.listdir(images):
         img = os.path.join(images, sample)
-        output_dir_1024 = os.path.join(output_dir_1024_root, sample)
-        output_dir_512 = os.path.join(output_dir_512_root, sample)
-
-        csv_dir_1024 = os.path.join(csv_dir_1024_root, sample)
-        csv_dir_512 = os.path.join(csv_dir_512_root, sample)
-
-        # Create output folders
-        os.makedirs(output_dir_1024, exist_ok=True)
-        os.makedirs(output_dir_512, exist_ok=True)
-
-        # Create CSV folders
-        os.makedirs(csv_dir_1024, exist_ok=True)
-        os.makedirs(csv_dir_512, exist_ok=True)
 
         # Batch process PNG images: generate patches of 1024x1024 and 512x512, and save to separate CSV files
-        batch_process_images(img, output_dir_1024, output_dir_512, csv_dir_1024, csv_dir_512)
+        batch_process_images(img, output_dir_1024_root, output_dir_512_root, csv_dir_1024_root, csv_dir_512_root)
