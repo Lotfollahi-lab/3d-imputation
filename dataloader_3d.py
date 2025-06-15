@@ -69,6 +69,7 @@ class ImageGraphDataset(Dataset):
         feature_1024 = self.data_list[idx]['feature_1024']
         feature_512 = self.data_list[idx]['feature_512']
 
+        # I am not sure why is the reason for this 
         idx_1024 = find_closest_column(self.data_list[idx]['label_1024'], self.layer_1024)
         idx_512 = find_closest_column(self.data_list[idx]['label_512'], self.layer_512)
 
@@ -117,41 +118,6 @@ def collate_fn(batch, adj_matrix, graph, is_weighted=False):
         adj_propagate = adj_sub * torch.tensor((sub_matrix+1))
 
     return images, labels, adj_sub, adj_propagate, positions, idx_1024, idx_512, features_1024, features_512, graph, known_label
-
-
-def collate_fn_test(batch, adj_matrix, graph, is_weighted=False):
-    images, labels, positions, idx_1024_list, idx_512_list, features_1024, features_512, idx_matrix, level = zip(*batch)
-
-    images = torch.stack(images)
-    labels = torch.tensor(labels)
-    positions = torch.tensor(positions)
-
-    features_1024 = torch.tensor(features_1024)
-    features_512 = torch.tensor(features_512)
-    idx_1024 = torch.tensor(idx_1024_list)
-    idx_512 = torch.tensor(idx_512_list)
-
-    indices = [i for i, x in enumerate(level) if x > 1]
-    indices_eval = [i for i, x in enumerate(level) if x == 1]
-
-    k = min(np.array(idx_matrix).shape[0]-1, 12)
-    num_random_edges = min(np.array(idx_matrix).shape[0]-1, 4)
-    sub_matrix = extract_submatrix_3D(adj_matrix, np.array(idx_matrix))
-    sub_inter_matrix = inter_layer_from_distance_matrix(sub_matrix, positions)
-
-    adj_sub = build_adj_matrix_with_similarity_and_known_labels(sub_matrix, indices_eval, k=k, num_random_edges=num_random_edges)+sub_inter_matrix
-    adj_sub[adj_sub > 0] = 1
-
-    known_label = copy.deepcopy(labels)
-    eval_label = copy.deepcopy(labels)
-    known_label[indices] = 0
-    eval_label[indices_eval] = 0
-    adj_propagate = torch.tensor(0)
-    if is_weighted:
-        adj_propagate = adj_sub * torch.tensor((sub_matrix+1))
-
-    return images, eval_label, adj_sub, adj_propagate, positions, idx_1024, idx_512, features_1024, features_512, graph, known_label, indices
-
 
 def collate_fn_result(batch, adj_matrix, graph, is_weighted=False):
     images, labels, positions, idx_1024_list, idx_512_list, features_1024, features_512, idx_matrix, level = zip(*batch)
@@ -243,32 +209,3 @@ def create_dataloaders_for_result_file(npy_file_paths, batch_size=32, transform=
 
     return dataloaders, testloader
 
-
-# def create_dataloaders_for_test_file(npy_file_paths, batch_size=32, transform=None):
-#     dataloaders = {}
-#     testloader = {}
-#     for npy_file in npy_file_paths:
-#         name = npy_file.split('/')[-1][:-4]
-#         # graph_path = f'./HER2_3D/3D_graph_data/{name}.pt'
-#         # adj_matrix_path = f'./HER2_3D/3D_combined_information/{name}.csv'
-#
-#         graph_path = f'./ST_Breast_3D/3D_graph_data/{name}.pt'
-#         adj_matrix_path = f'./ST_Breast_3D/3D_combined_information/{name}.csv'
-#
-#         dataset = ImageGraphDataset(npy_file, graph_path, adj_matrix_path, transform=transform)
-#         adj_matrix_df = dataset.adj_matrix
-#         graph_data = dataset.graph
-#
-#         def collate_fn_with_params(batch, adj_matrix_dfs=adj_matrix_df, graph_datas=graph_data):
-#             return collate_fn(batch, adj_matrix_dfs, graph_datas, is_weighted=False)
-#
-#         def collate_fn_test_with_params(batch, adj_matrix_dfs=adj_matrix_df, graph_datas=graph_data):
-#             return collate_fn_test(batch, adj_matrix_dfs, graph_datas, is_weighted=False)
-#
-#         dataloaders[npy_file] = DataLoader(dataset.get_train_dataset(), batch_size=batch_size, shuffle=True,
-#                                            collate_fn=collate_fn_with_params)
-#
-#         testloader[npy_file] = DataLoader(dataset, batch_size=batch_size, shuffle=True,
-#                                           collate_fn=collate_fn_test_with_params)
-#
-#     return dataloaders, testloader
