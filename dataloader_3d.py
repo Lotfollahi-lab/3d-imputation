@@ -81,6 +81,7 @@ class ImageGraphDataset(Dataset):
 
 
         idx_matrix = self.adj_matrix.columns.get_loc(column_name)
+        # 'level' may indicate the depth or the slide from which this feature was extracted
         level = self.data_list[idx]['level']
 
         return image, label.astype(np.float32), position, int(idx_1024), int(idx_512), feature_1024.astype(
