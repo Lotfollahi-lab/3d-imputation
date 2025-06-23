@@ -283,7 +283,7 @@ if __name__ == "__main__":
                         mse_metrics.append(val_loss / total_samples)
                         mae_metrics.append(val_mae / total_samples)
                         pcc_metrics.append(val_pcc.cpu().numpy() / total_samples)
-                        torch.save(model.state_dict(), os.path.join(save_path, f'model_weights_{fold}.pth'))
+                        torch.save(model.state_dict(), os.path.join(save_path, f'model_weights_{fold_index + 1}.pth'))
 
             save_dict['mse'] = mse_metrics
             save_dict['mae'] = mae_metrics
