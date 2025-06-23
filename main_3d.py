@@ -91,6 +91,7 @@ if __name__ == "__main__":
     save_dict = {}
 
     # Here is cross validation code for ST data
+    '''
     all_folders = sorted([os.path.join(label_root, folder) for folder in os.listdir(label_root)])
     num_folders = len(all_folders)
     fold_size = num_folders // 4
@@ -109,43 +110,43 @@ if __name__ == "__main__":
         part_trainloader, test_dataloader = create_dataloaders_for_result_file(val_labels_path, batch_size=128,
                                                                              transform=img_transform, root_path=args.root_path)
         train_dataloaders.update(part_trainloader)
-
-    # # Here is cross validation code for HER2
-    # image_dict = {}
-    #
-    # # According to image naming conventions (e.g. A1.npy, A2.npy, B1.npy...) Parse the picture
-    # for image in image_folder_paths:
-    #     sample_name = image[0]
-    #     if sample_name not in image_dict:
-    #         image_dict[sample_name] = []
-    #     image_dict[sample_name].append(image)
-    # fold_splits = [
-    #     {'A', 'E'},
-    #     {'B', 'F'},
-    #     {'C', 'G'},
-    #     {'D', 'H'},
-    # ]
-    # results = []
-    # for fold_index, fold_split in enumerate(fold_splits):
-    #
-    #     train_labels_path = []
-    #     val_labels_path = []
-    #
-    #     print(f"\nFold {fold_index + 1}:")
-    #
-    #     for sample, images in image_dict.items():
-    #         print(sample, images)
-    #         if sample not in fold_split:
-    #             train_labels_path.append(os.path.join(label_root, images[0]))
-    #         else:
-    #             val_labels = os.path.join(label_root, images[0])
-    #             val_labels_path.append(val_labels)
-    #
-    #     train_dataloaders = create_dataloaders_for_train_file(train_labels_path, batch_size=128,
-    #                                                           transform=img_transform)
-    #     part_trainloader, test_dataloader = create_dataloaders_for_result_file(val_labels_path, batch_size=128,
-    #                                                                            transform=img_transform)
-    #     train_dataloaders.update(part_trainloader)
+    '''
+    # Here is cross validation code for HER2
+    image_dict = {}
+    
+    # According to image naming conventions (e.g. A1.npy, A2.npy, B1.npy...) Parse the picture
+    for image in image_folder_paths:
+         sample_name = image[0]
+         if sample_name not in image_dict:
+             image_dict[sample_name] = []
+         image_dict[sample_name].append(image)
+    fold_splits = [
+         {'A', 'E'},
+         {'B', 'F'},
+         {'C', 'G'},
+         {'D', 'H'},
+    ]
+    results = []
+    for fold_index, fold_split in enumerate(fold_splits):
+    
+        train_labels_path = []
+        val_labels_path = []
+    
+        print(f"\nFold {fold_index + 1}:")
+    
+        for sample, images in image_dict.items():
+            print(sample, images)
+            if sample not in fold_split:
+                 train_labels_path.append(os.path.join(label_root, images[0]))
+            else:
+                 val_labels = os.path.join(label_root, images[0])
+                 val_labels_path.append(val_labels)
+    
+        train_dataloaders = create_dataloaders_for_train_file(train_labels_path, batch_size=128,
+                                                               transform=img_transform, root_path=args.root_path)
+        part_trainloader, test_dataloader = create_dataloaders_for_result_file(val_labels_path, batch_size=128,
+                                                                                transform=img_transform, root_path=args.root_path)
+        train_dataloaders.update(part_trainloader)
 
         iter_num = 0
         max_epoch = 51
