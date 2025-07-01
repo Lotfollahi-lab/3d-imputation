@@ -89,7 +89,16 @@ class ImageGraphDataset(Dataset):
             np.float32), feature_512.astype(np.float32), int(idx_matrix), int(level)
 
     def get_train_dataset(self):
-        return Subset(self, range(len(self.train_data)))
+        # this bug exists in the original code
+        # that create the validation set from the train set
+        # in the wrong manner
+        #return Subset(self, range(len(self.train_data)))
+        train_idxs = [
+            idx
+            for idx, item in enumerate(self.data_list)
+            if item.get('level', 1) == 1
+        ]
+        return Subset(self, train_idxs)
 
 
 def collate_fn(batch, adj_matrix, graph, is_weighted=False):
@@ -111,7 +120,7 @@ def collate_fn(batch, adj_matrix, graph, is_weighted=False):
     idx_1024 = torch.tensor(idx_1024_list)
     idx_512 = torch.tensor(idx_512_list)
 
-    known_label = retain_random_rows(labels, retain_ratio=0.25)
+    known_label = retain_random_rows(labels, retain_ratio=0.2)
 
     adj_propagate = torch.tensor(0)
     if is_weighted:
