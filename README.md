@@ -151,7 +151,7 @@ MSAGNet comprises cross-attention layers, GAT blocks, and Transformer layers to 
 - To train ASIGN on 3D-level prediction, run `main_3d.py`:
 
   ```bash
-  CUDA_VISIBLE_DEVICES=0 python main_3d.py --root_path '' --base_lr 0.001 --batch_size 128
+  CUDA_VISIBLE_DEVICES=0 python -m pdb  main_3d.py --root_path ../../3d-imputation-data/HER2_3D/ --base_lr 0.0001 --batch_size 256
   ```
 ------
 
