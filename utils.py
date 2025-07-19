@@ -1,6 +1,5 @@
 import numpy as np
 import pandas as pd
-import tifffile
 import anndata as ad
 from shapely.geometry import Polygon, Point
 from tqdm import tqdm
@@ -102,24 +101,25 @@ def compute_iou_between_samples(spots1: Dict, spots2: Dict, radius: float) -> Li
     polygons2 = [create_circle_polygon(coord[0], coord[1], radius) for coord in spots2['coordinates']]
     
     # Compute IoU for all pairs
-    for i, (spot1_id, poly1) in enumerate(zip(spots1['spot_ids'], polygons1)):
-        for j, (spot2_id, poly2) in enumerate(zip(spots2['spot_ids'], polygons2)):
+    for i, (spot1_id, poly1) in tqdm(enumerate(zip(spots1['spot_ids'], polygons1))):
+        if (i +1 ) % 100 == 0:
+            break
+        for j, (spot2_id, poly2) in tqdm(enumerate(zip(spots2['spot_ids'], polygons2))):
             iou_score = compute_iou_pair(poly1, poly2)
             results.append((spot1_id, spot2_id, iou_score))
     
     return results
 
 
-def compute_iou(tif_path: str, adata_path: str, output_csv_path: str, radius: float = 112.0, 
+def compute_iou(adata_path: str, output_csv_path: str, radius: float = 112.0, 
                 spatial_scale: float = 15.0, n_jobs: int = -1) -> None:
     """
-    Compute IoU scores between spots across different samples/layers from TIF and h5ad data.
+    Compute IoU scores between spots across different samples/layers from h5ad data.
     
-    This function loads a multi-layer TIF image and corresponding AnnData object,
-    then computes IoU scores between circular regions around each spot across all sample pairs.
+    This function loads an AnnData object and computes IoU scores between circular 
+    regions around each spot across all sample pairs.
     
     Args:
-        tif_path (str): Path to the multi-layer TIF image file
         adata_path (str): Path to the h5ad AnnData file
         output_csv_path (str): Path to save the output CSV file
         radius (float): Radius for creating circles around each spot (default: 112.0)
@@ -130,10 +130,6 @@ def compute_iou(tif_path: str, adata_path: str, output_csv_path: str, radius: fl
         CSV file with columns: ['spot1_id', 'spot2_id', 'sample1', 'sample2', 'iou_score']
     """
     print("🔬 Loading data...")
-    
-    # Load TIF image data
-    tif_data = tifffile.imread(tif_path)
-    print(f"📊 TIF data shape: {tif_data.shape}")
     
     # Load AnnData
     adata = ad.read_h5ad(adata_path)
@@ -152,9 +148,9 @@ def compute_iou(tif_path: str, adata_path: str, output_csv_path: str, radius: fl
         sample_spots[sample_id] = extract_spots_from_sample(adata, sample_id, spatial_scale)
         print(f"Sample {sample_id}: {len(sample_spots[sample_id]['spot_ids'])} spots")
     
-    # Compute IoU between all sample pairs (avoiding duplicates)
+    # Compute IoU between all sample pairs (avoiding duplicates and same-layer pairs)
     all_results = []
-    total_pairs = (n_samples * (n_samples - 1)) // 2 + n_samples  # Include self-pairs
+    total_pairs = (n_samples * (n_samples - 1)) // 2  # Exclude self-pairs
     
     print(f"🧮 Computing IoU for {total_pairs} sample pairs...")
     
@@ -162,8 +158,8 @@ def compute_iou(tif_path: str, adata_path: str, output_csv_path: str, radius: fl
     with tqdm(total=total_pairs, desc="Computing IoU") as pbar:
         for i, sample1 in enumerate(unique_samples):
             for j, sample2 in enumerate(unique_samples):
-                # Only compute upper triangle + diagonal to avoid duplicates
-                if j >= i:
+                # Only compute upper triangle to avoid duplicates, exclude diagonal (same layer)
+                if j > i:
                     print(f"🔍 Processing pair: {sample1} vs {sample2}")
                     
                     # Compute IoU between the two samples
@@ -206,64 +202,25 @@ def compute_iou(tif_path: str, adata_path: str, output_csv_path: str, radius: fl
     print(f"💾 Results saved to: {output_csv_path}")
 
 
-def validate_data_compatibility(tif_path: str, adata_path: str) -> bool:
-    """
-    Validate that TIF and AnnData files are compatible.
-    
-    Args:
-        tif_path (str): Path to TIF file
-        adata_path (str): Path to h5ad file
-    
-    Returns:
-        bool: True if compatible, False otherwise
-    """
-    try:
-        # Load data
-        tif_data = tifffile.imread(tif_path)
-        adata = ad.read_h5ad(adata_path)
-        
-        # Check if number of images matches number of unique samples
-        n_images = tif_data.shape[0] if len(tif_data.shape) > 3 else 1
-        n_samples = len(adata.obs['sample'].unique())
-        
-        print(f"🔍 Validation:")
-        print(f"   TIF images: {n_images}")
-        print(f"   Unique samples: {n_samples}")
-        
-        if n_images == n_samples:
-            print("✅ Data compatibility confirmed!")
-            return True
-        else:
-            print("❌ Warning: Number of images doesn't match number of samples!")
-            return False
-            
-    except Exception as e:
-        print(f"❌ Validation failed: {e}")
-        return False
-
 
 # Example usage function
 def example_usage():
     """
     Example of how to use the compute_iou function.
     """
-    TIF_PATH = '/nfs/team361/data/sanger_whole_embryo/aligned_downsampled_2_reg.ome.tif'
     ADATA_PATH = '/nfs/team361/data/sanger_whole_embryo/adata_CS17.h5ad'
+    ADATA_PATH = '/lustre/scratch126/cellgen/lotfollahi/mv10/3d-imputation-data/adata_CS17_2.h5ad'
+
     OUTPUT_CSV = './embryo_data/spot_iou/embryo_iou_results.csv'
     
-    # Validate data compatibility first
-    if validate_data_compatibility(TIF_PATH, ADATA_PATH):
-        # Compute IoU
-        compute_iou(
-            tif_path=TIF_PATH,
-            adata_path=ADATA_PATH,
-            output_csv_path=OUTPUT_CSV,
-            radius=112.0,  # Adjust radius as needed
-            spatial_scale=15.0,  # Adjust scaling as needed
-            n_jobs=-1
-        )
-    else:
-        print("❌ Data validation failed. Please check your input files.")
+    # Compute IoU
+    compute_iou(
+        adata_path=ADATA_PATH,
+        output_csv_path=OUTPUT_CSV,
+        radius=112.0,  # Adjust radius as needed
+        spatial_scale=15.0,  # Adjust scaling as needed
+        n_jobs=-1
+    )
 
 
 if __name__ == "__main__":
