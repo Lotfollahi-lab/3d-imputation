@@ -5,6 +5,7 @@ from shapely.geometry import Polygon, Point
 from tqdm import tqdm
 import math
 import os
+import time
 from typing import Tuple, List, Dict
 from joblib import Parallel, delayed
 
@@ -27,6 +28,25 @@ def create_circle_polygon(center_x: float, center_y: float, radius: float, num_p
     return Polygon(points)
 
 
+def is_iou_zero(center1: Tuple[float, float], r1: float, center2: Tuple[float, float], r2: float) -> bool:
+    """
+    Fast check if IoU between two circles would be zero (no overlap).
+    
+    Args:
+        center1 (Tuple[float, float]): Center coordinates of first circle
+        r1 (float): Radius of first circle
+        center2 (Tuple[float, float]): Center coordinates of second circle
+        r2 (float): Radius of second circle
+    
+    Returns:
+        bool: True if IoU would be zero (no overlap), False otherwise
+    """
+    dx = center1[0] - center2[0]
+    dy = center1[1] - center2[1]
+    distance = math.hypot(dx, dy)
+    return distance >= (r1 + r2)
+
+
 def compute_iou_pair(poly1: Polygon, poly2: Polygon) -> float:
     """
     Compute the IoU (Intersection over Union) of two polygons.
@@ -45,6 +65,30 @@ def compute_iou_pair(poly1: Polygon, poly2: Polygon) -> float:
     except Exception as e:
         print(f"Warning: IoU computation failed: {e}")
         return 0.0
+
+
+def compute_iou_pair_optimized(coord1: Tuple[float, float], coord2: Tuple[float, float], 
+                              radius: float) -> float:
+    """
+    Optimized IoU computation with fast zero-check.
+    
+    Args:
+        coord1 (Tuple[float, float]): Center coordinates of first circle
+        coord2 (Tuple[float, float]): Center coordinates of second circle
+        radius (float): Radius for both circles
+    
+    Returns:
+        float: IoU score (0 to 1)
+    """
+    # Fast check: if circles don't overlap, IoU = 0
+    if is_iou_zero(coord1, radius, coord2, radius):
+        return 0.0
+    
+    # If circles might overlap, compute actual IoU using polygons
+    poly1 = create_circle_polygon(coord1[0], coord1[1], radius)
+    poly2 = create_circle_polygon(coord2[0], coord2[1], radius)
+    
+    return compute_iou_pair(poly1, poly2)
 
 
 def extract_spots_from_sample(adata: ad.AnnData, sample_id: str, spatial_scale: float = 15.0) -> Dict:
@@ -80,35 +124,51 @@ def extract_spots_from_sample(adata: ad.AnnData, sample_id: str, spatial_scale: 
     return spot_info
 
 
-def compute_iou_between_samples(spots1: Dict, spots2: Dict, radius: float) -> List[Tuple]:
+def compute_single_iou(args: Tuple) -> Tuple[str, str, float]:
     """
-    Compute IoU between all spot pairs from two samples.
+    Compute IoU for a single pair of spots (for parallel processing).
+    
+    Args:
+        args (Tuple): (spot1_id, coord1, spot2_id, coord2, radius)
+    
+    Returns:
+        Tuple[str, str, float]: (spot1_id, spot2_id, iou_score)
+    """
+    spot1_id, coord1, spot2_id, coord2, radius = args
+    iou_score = compute_iou_pair_optimized(coord1, coord2, radius)
+    return (spot1_id, spot2_id, iou_score)
+
+
+def compute_iou_between_samples(spots1: Dict, spots2: Dict, radius: float, n_jobs: int = -1) -> List[Tuple]:
+    """
+    Compute IoU between all spot pairs from two samples using parallel processing.
     
     Args:
         spots1 (Dict): Spot information from first sample
         spots2 (Dict): Spot information from second sample
         radius (float): Radius for circle creation around each spot
+        n_jobs (int): Number of parallel jobs
     
     Returns:
         List[Tuple]: List of (spot1_id, spot2_id, iou_score) tuples
     """
-    results = []
+    # Prepare all pairs for parallel computation
+    pair_args = []
+    for i, (spot1_id, coord1) in enumerate(zip(spots1['spot_ids'], spots1['coordinates'])):
+        for j, (spot2_id, coord2) in enumerate(zip(spots2['spot_ids'], spots2['coordinates'])):
+            pair_args.append((spot1_id, coord1, spot2_id, coord2, radius))
     
-    # Create polygons for sample 1
-    polygons1 = [create_circle_polygon(coord[0], coord[1], radius) for coord in spots1['coordinates']]
+    # Parallel computation of IoU for all pairs
+    results = Parallel(n_jobs=n_jobs, backend='loky', verbose=0)(
+        delayed(compute_single_iou)(args) for args in tqdm(pair_args, desc="Computing IoU pairs", leave=False)
+    )
     
-    # Create polygons for sample 2
-    polygons2 = [create_circle_polygon(coord[0], coord[1], radius) for coord in spots2['coordinates']]
+    # Filter out zero IoU results to save memory
+    non_zero_results = [(spot1, spot2, iou) for spot1, spot2, iou in results if iou > 0.0]
     
-    # Compute IoU for all pairs
-    for i, (spot1_id, poly1) in tqdm(enumerate(zip(spots1['spot_ids'], polygons1))):
-        if (i +1 ) % 100 == 0:
-            break
-        for j, (spot2_id, poly2) in tqdm(enumerate(zip(spots2['spot_ids'], polygons2))):
-            iou_score = compute_iou_pair(poly1, poly2)
-            results.append((spot1_id, spot2_id, iou_score))
+    print(f"    📊 Non-zero IoU pairs: {len(non_zero_results)}/{len(results)} ({100*len(non_zero_results)/len(results):.1f}%)")
     
-    return results
+    return non_zero_results
 
 
 def compute_iou(adata_path: str, output_csv_path: str, radius: float = 112.0, 
@@ -163,11 +223,15 @@ def compute_iou(adata_path: str, output_csv_path: str, radius: float = 112.0,
                     print(f"🔍 Processing pair: {sample1} vs {sample2}")
                     
                     # Compute IoU between the two samples
+                    start_time = time.time()
                     pair_results = compute_iou_between_samples(
                         sample_spots[sample1], 
                         sample_spots[sample2], 
-                        radius
+                        radius,
+                        n_jobs
                     )
+                    elapsed_time = time.time() - start_time
+                    print(f"    ⏱️  Completed in {elapsed_time:.2f} seconds")
                     
                     # Add sample information to results
                     for spot1_id, spot2_id, iou_score in pair_results:
