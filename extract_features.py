@@ -146,7 +146,7 @@ def extract_all_features(
 ) -> None:
     t0 = time.time()
     print("🧬 Loading image & AnnData…")
-    img_arr = tifffile.imread(image_path)
+    #img_arr = tifffile.imread(image_path)
     adata = ad.read_h5ad(adata_path)
 
     # preprocessing + model
