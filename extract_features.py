@@ -14,11 +14,6 @@ import anndata as ad
 
 
 class PatchDataset(Dataset):
-    """
-    Dataset of image patches across multiple samples & sizes.
-    Each item returns (sample_idx, size, patch_tensor, patch_id).
-    """
-
     def __init__(
         self,
         img_array: np.ndarray,
@@ -27,26 +22,17 @@ class PatchDataset(Dataset):
         spatial_scale: float,
         preprocess: transforms.Compose,
     ):
-        """
-        Args:
-          img_array    : np array [n_samples, H, W, C] or [n_samples, C, H, W]
-          adata        : loaded AnnData with obs['sample'] and obsm['spatial']
-          windows_csv  : CSV path with columns [sample,window_size,x,y]
-          spatial_scale: float
-          preprocess   : torchvision transforms to apply to each patch
-        """
-        # ensure shape [n_samples, H, W, C]
+        # ensure [n_samples,H,W,C]
         if img_array.ndim == 4 and img_array.shape[1] in (1,3,4):
-            # move channel from axis=1 to last
             img_array = np.moveaxis(img_array, 1, -1)
         self.img_array = img_array
         self.H, self.W = img_array.shape[1], img_array.shape[2]
 
-        # map sample names to integer indices
+        # sample name → slice index
         samples = list(adata.obs['sample'].unique())
         self.sample_to_idx = {s: i for i, s in enumerate(samples)}
 
-        # build metadata list
+        # build meta rows
         self.meta: List[Dict[str, Any]] = []
         half224 = 224 // 2
         coords = (adata.obsm['spatial'] * spatial_scale).astype(int)
@@ -56,67 +42,82 @@ class PatchDataset(Dataset):
             if 0 <= x0 <= self.W - 224 and 0 <= y0 <= self.H - 224:
                 self.meta.append({
                     'sample_idx': idx,
+                    'sample_id': sample,
                     'size': 224,
-                    'x0': x0,
-                    'y0': y0,
-                    'patch_id': f"{sample}_224_{x0}_{y0}"
+                    'x': x0,
+                    'y': y0,
                 })
 
         df = pd.read_csv(windows_csv)
         for _, row in df.iterrows():
-            sname = str(row['sample'])
-            if sname not in self.sample_to_idx:
+            s = str(row['sample'])
+            if s not in self.sample_to_idx:
                 continue
-            idx = self.sample_to_idx[sname]
+            idx = self.sample_to_idx[s]
             sz = int(row['window_size'])
             x0, y0 = int(row['x']), int(row['y'])
             if 0 <= x0 <= self.W - sz and 0 <= y0 <= self.H - sz:
                 self.meta.append({
                     'sample_idx': idx,
+                    'sample_id': s,
                     'size': sz,
-                    'x0': x0,
-                    'y0': y0,
-                    'patch_id': f"{sname}_{sz}_{x0}_{y0}"
+                    'x': x0,
+                    'y': y0,
                 })
 
-        # group indices by size for homogeneous batching
+        # group for homogeneous batches
         self.by_size: Dict[int, List[int]] = {}
-        for idx, m in enumerate(self.meta):
-            self.by_size.setdefault(m['size'], []).append(idx)
+        for i, m in enumerate(self.meta):
+            self.by_size.setdefault(m['size'], []).append(i)
 
         self.preprocess = preprocess
 
     def __len__(self) -> int:
         return len(self.meta)
 
-    def __getitem__(self, idx: int) -> Tuple[int, torch.Tensor, str]:
-        """
-        Returns:
-          sample_idx (int), tensor [3, size, size], patch_id (str)
-        """
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, str, int, int, int]:
         m = self.meta[idx]
-        img_patch = self.img_array[
-            m['sample_idx'],
-            m['y0']:m['y0']+m['size'],
-            m['x0']:m['x0']+m['size'],
-            :
+        patch = self.img_array[
+            m['sample_idx'], m['y']:m['y']+m['size'],
+            m['x']:m['x']+m['size'], :
         ]
-        # convert to PIL and preprocess
-        patch = Image.fromarray(img_patch)
-        tensor = self.preprocess(patch)
-        return m['sample_idx'], tensor, m['patch_id']
+        img = Image.fromarray(patch)
+        tensor = self.preprocess(img)
+        # return tensor plus metadata for obs
+        return tensor, m['sample_id'], m['size'], m['x'], m['y']
 
 
-def collate_homogeneous(batch: List[Tuple[int, torch.Tensor, str]]) -> Tuple[torch.Tensor, List[str]]:
+def collate_homogeneous(batch: List[Tuple[torch.Tensor, str, int, int, int]]
+) -> Tuple[torch.Tensor, List[str], List[int], List[int], List[int]]:
+    imgs, samples, sizes, xs, ys = zip(*batch)
+    return (torch.stack(imgs, 0),
+            list(samples), list(sizes), list(xs), list(ys))
+
+
+def build_feature_adata(
+    windows_csv: str,
+    sample_ids: List[str],
+    sizes: List[int],
+    xs: List[int],
+    ys: List[int],
+    features: np.ndarray,
+    target_dim: int
+) -> ad.AnnData:
     """
-    Collate function that stacks only if all sizes match in the batch.
-    Returns:
-       batch_tensor [B,3,sz,sz], list of patch_ids
+    Create a new AnnData where obs has sample_id, size, x, y; obsm['features'] holds matrix.
     """
-    # batch is guaranteed homogeneous by how we'll feed indices to DataLoader
-    _, tensors, ids = zip(*batch)
-    stacked = torch.stack(tensors, dim=0)
-    return stacked, list(ids)
+    obs = pd.DataFrame({
+        'sample_id': sample_ids,
+        'size': sizes,
+        'x': xs,
+        'y': ys
+    })
+    ad_new = ad.AnnData(
+        obs = obs,
+        dtype=np.float32
+    )
+    ad_new.obsm['features'] = features   # shape [n_patches, target_dim]
+    return ad_new
 
 
 def extract_all_features(
@@ -127,71 +128,75 @@ def extract_all_features(
     target_dim: int = 1024,
     batch_size: int = 32,
     num_workers: int = 4,
-    output_adata_path: str = './adata_with_features.h5ad'
+    output_adata_path: str = './patch_features.h5ad'
 ) -> None:
-    """
-    Driver using PatchDataset + DataLoader to batch preprocess CPU-side
-    and GPU-forward each homogeneous batch.
-    """
     t0 = time.time()
-    print("🔬 Loading data...")
+    print("🧬 Loading image & AnnData…")
     img_arr = tifffile.imread(image_path)
     adata = ad.read_h5ad(adata_path)
 
-    # preprocessing & model
+    # preprocessing + model
     preprocess = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485,0.456,0.406],
-                             std=[0.229,0.224,0.225]),
+        transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225]),
     ])
     resnet = models.resnet50(pretrained=True)
     backbone = nn.Sequential(*list(resnet.children())[:-1]).eval()
-    reducer = nn.Linear(2048, target_dim).eval()
+    reducer  = nn.Linear(2048, target_dim).eval()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     backbone.to(device); reducer.to(device)
 
     # build dataset
     ds = PatchDataset(img_arr, adata, windows_csv, spatial_scale, preprocess)
 
-    # prepare storage
-    feat_store: Dict[int, Dict[str, np.ndarray]] = {}
+    # collect all metadata + features
+    all_samples: List[str] = []
+    all_sizes:   List[int] = []
+    all_xs:      List[int] = []
+    all_ys:      List[int] = []
+    all_feats:   List[np.ndarray] = []
 
-    # for each size, create a DataLoader over that subset
-    for size, indices in ds.by_size.items():
-        print(f"▶ Processing patches of size {size} ({len(indices)} total)")
+    # process each size separately
+    for size, idxs in ds.by_size.items():
+        print(f"Processing size {size}, {len(idxs)} patches…")
         loader = DataLoader(
-            ds,
-            batch_size=batch_size,
-            sampler=torch.utils.data.SubsetRandomSampler(indices),
+            ds, batch_size=batch_size,
+            sampler=torch.utils.data.SubsetRandomSampler(idxs),
             collate_fn=collate_homogeneous,
             num_workers=num_workers,
-            pin_memory=True,
+            pin_memory=True
         )
-
-        for batch_idx, (batch_tensor, patch_ids) in enumerate(loader):
-            batch_tensor = batch_tensor.to(device)
+        for batch_imgs, samples, sizes, xs, ys in loader:
+            batch_imgs = batch_imgs.to(device)
             with torch.no_grad():
-                feats2048 = backbone(batch_tensor).view(batch_tensor.size(0), -1)
-                feats = reducer(feats2048).cpu().numpy()
+                f2048 = backbone(batch_imgs).view(len(batch_imgs), -1)
+                f1024 = reducer(f2048).cpu().numpy()
+            all_feats.append(f1024)
+            all_samples.extend(samples)
+            all_sizes.extend(sizes)
+            all_xs.extend(xs)
+            all_ys.extend(ys)
 
-            # store per-patch
-            for pid, fv in zip(patch_ids, feats):
-                feat_store.setdefault(size, {})[pid] = fv
+    # stack features
+    features = np.vstack(all_feats)  # [n_patches, target_dim]
 
-            if (batch_idx + 1) % 10 == 0:
-                print(f"    processed {batch_idx+1}/{len(loader)} batches")
+    # build and save new AnnData
+    ad_out = build_feature_adata(
+        windows_csv,
+        all_samples,
+        all_sizes,
+        all_xs,
+        all_ys,
+        features,
+        target_dim
+    )
 
-    # attach to AnnData
-    adata.uns['patch_features'] = {str(sz): feat_store[sz] for sz in sorted(feat_store)}
-
-    # save
-    print("💾 Saving AnnData...")
+    print("Saving output AnnData…")
     os.makedirs(os.path.dirname(output_adata_path), exist_ok=True)
-    adata.write_h5ad(output_adata_path)
+    ad_out.write_h5ad(output_adata_path)
 
-    print(f"✅ Finished in {(time.time()-t0):.1f}s")
-    for sz, d in adata.uns['patch_features'].items():
-        print(f"   size {sz}: {len(d)} patches")
+    print(f"Done in {time.time()-t0:.1f}s. Written {ad_out.n_obs} patches.")
+
 
 
 if __name__ == "__main__":
@@ -207,4 +212,3 @@ if __name__ == "__main__":
         num_workers=8,
         output_adata_path="./adata_with_features.h5ad"
     )
-
