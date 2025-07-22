@@ -1,107 +1,122 @@
 import os
 import time
-from typing import List, Tuple, Dict, Any
+from typing import List, Dict, Any, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
 from torch import nn
 from torchvision import models, transforms
+from torch.utils.data import Dataset, DataLoader
 from PIL import Image
-from joblib import Parallel, delayed
-from tqdm import tqdm
+import tifffile
 import anndata as ad
 
 
-def load_model_and_preprocess(target_dim: int = 1024) -> Tuple[nn.Module, transforms.Compose, torch.device]:
+class PatchDataset(Dataset):
     """
-    Load a pretrained ResNet50 backbone (no head) plus a reducer linear layer,
-    and build the preprocessing pipeline.
+    Dataset of image patches across multiple samples & sizes.
+    Each item returns (sample_idx, size, patch_tensor, patch_id).
+    """
 
-    Args:
-        target_dim (int): Dimension to reduce the 2048‑d output to.
+    def __init__(
+        self,
+        img_array: np.ndarray,
+        adata: ad.AnnData,
+        windows_csv: str,
+        spatial_scale: float,
+        preprocess: transforms.Compose,
+    ):
+        """
+        Args:
+          img_array    : np array [n_samples, H, W, C] or [n_samples, C, H, W]
+          adata        : loaded AnnData with obs['sample'] and obsm['spatial']
+          windows_csv  : CSV path with columns [sample,window_size,x,y]
+          spatial_scale: float
+          preprocess   : torchvision transforms to apply to each patch
+        """
+        # ensure shape [n_samples, H, W, C]
+        if img_array.ndim == 4 and img_array.shape[1] in (1,3,4):
+            # move channel from axis=1 to last
+            img_array = np.moveaxis(img_array, 1, -1)
+        self.img_array = img_array
+        self.H, self.W = img_array.shape[1], img_array.shape[2]
 
+        # map sample names to integer indices
+        samples = list(adata.obs['sample'].unique())
+        self.sample_to_idx = {s: i for i, s in enumerate(samples)}
+
+        # build metadata list
+        self.meta: List[Dict[str, Any]] = []
+        half224 = 224 // 2
+        coords = (adata.obsm['spatial'] * spatial_scale).astype(int)
+        for sample, (xc, yc) in zip(adata.obs['sample'], coords):
+            idx = self.sample_to_idx[sample]
+            x0, y0 = xc - half224, yc - half224
+            if 0 <= x0 <= self.W - 224 and 0 <= y0 <= self.H - 224:
+                self.meta.append({
+                    'sample_idx': idx,
+                    'size': 224,
+                    'x0': x0,
+                    'y0': y0,
+                    'patch_id': f"{sample}_224_{x0}_{y0}"
+                })
+
+        df = pd.read_csv(windows_csv)
+        for _, row in df.iterrows():
+            sname = str(row['sample'])
+            if sname not in self.sample_to_idx:
+                continue
+            idx = self.sample_to_idx[sname]
+            sz = int(row['window_size'])
+            x0, y0 = int(row['x']), int(row['y'])
+            if 0 <= x0 <= self.W - sz and 0 <= y0 <= self.H - sz:
+                self.meta.append({
+                    'sample_idx': idx,
+                    'size': sz,
+                    'x0': x0,
+                    'y0': y0,
+                    'patch_id': f"{sname}_{sz}_{x0}_{y0}"
+                })
+
+        # group indices by size for homogeneous batching
+        self.by_size: Dict[int, List[int]] = {}
+        for idx, m in enumerate(self.meta):
+            self.by_size.setdefault(m['size'], []).append(idx)
+
+        self.preprocess = preprocess
+
+    def __len__(self) -> int:
+        return len(self.meta)
+
+    def __getitem__(self, idx: int) -> Tuple[int, torch.Tensor, str]:
+        """
+        Returns:
+          sample_idx (int), tensor [3, size, size], patch_id (str)
+        """
+        m = self.meta[idx]
+        img_patch = self.img_array[
+            m['sample_idx'],
+            m['y0']:m['y0']+m['size'],
+            m['x0']:m['x0']+m['size'],
+            :
+        ]
+        # convert to PIL and preprocess
+        patch = Image.fromarray(img_patch)
+        tensor = self.preprocess(patch)
+        return m['sample_idx'], tensor, m['patch_id']
+
+
+def collate_homogeneous(batch: List[Tuple[int, torch.Tensor, str]]) -> Tuple[torch.Tensor, List[str]]:
+    """
+    Collate function that stacks only if all sizes match in the batch.
     Returns:
-        backbone (nn.Module): ResNet50 up to avgpool, outputs [B×2048×1×1]
-        reducer  (nn.Module): Linear layer 2048→target_dim
-        preprocess (Compose): torchvision transforms for ResNet50
-        device   (torch.device): cuda if available, else cpu
+       batch_tensor [B,3,sz,sz], list of patch_ids
     """
-    # preprocessing
-    preprocess = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]),
-    ])
-
-    # load ResNet50, strip the final fc
-    resnet = models.resnet50(pretrained=True)
-    backbone = nn.Sequential(*list(resnet.children())[:-1])
-    reducer = nn.Linear(2048, target_dim)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    backbone.to(device).eval()
-    reducer.to(device).eval()
-
-    return backbone, reducer, preprocess, device
-
-
-def extract_patch_feature(
-    img: Image.Image,
-    backbone: nn.Module,
-    reducer: nn.Module,
-    preprocess: transforms.Compose,
-    device: torch.device,
-    sample: str,
-    x: int,
-    y: int,
-    size: int,
-    centered: bool,
-) -> Dict[str, Any]:
-    """
-    Crop one image patch, run through model, and return its feature vector + metadata.
-
-    Args:
-        img      (PIL.Image): full image
-        backbone (nn.Module): feature extractor
-        reducer  (nn.Module): 2048→target_dim
-        preprocess (Compose): transforms
-        device   (torch.device)
-        sample   (str): sample_id
-        x, y     (int): if centered, patch center; if not, top-left corner
-        size     (int): patch size (e.g. 224, 512, 1024)
-        centered (bool): True if (x,y) is center, False if top-left
-
-    Returns:
-        dict with keys ['patch_id','sample','x','y','size','feature']
-    """
-    # determine top-left
-    if centered:
-        x0 = int(x - size // 2)
-        y0 = int(y - size // 2)
-    else:
-        x0, y0 = x, y
-
-    # skip out-of-bounds
-    W, H = img.width, img.height
-    if x0 < 0 or y0 < 0 or x0 + size > W or y0 + size > H:
-        return None
-
-    patch = img.crop((x0, y0, x0 + size, y0 + size))
-    tensor = preprocess(patch).unsqueeze(0).to(device)
-
-    with torch.no_grad():
-        feat2048 = backbone(tensor).reshape(1, -1)          # [1×2048]
-        feat      = reducer(feat2048).cpu().numpy().squeeze()  # [target_dim]
-
-    patch_id = f"{sample}_{size}_{x0}_{y0}"
-    return {
-        'patch_id':  patch_id,
-        'sample':    sample,
-        'x':         x0,
-        'y':         y0,
-        'size':      size,
-        'feature':   feat
-    }
+    # batch is guaranteed homogeneous by how we'll feed indices to DataLoader
+    _, tensors, ids = zip(*batch)
+    stacked = torch.stack(tensors, dim=0)
+    return stacked, list(ids)
 
 
 def extract_all_features(
@@ -110,103 +125,86 @@ def extract_all_features(
     windows_csv: str,
     spatial_scale: float,
     target_dim: int = 1024,
-    n_jobs: int = -1,
-    output_adata_path: str = './adata_with_features.h5ad',
+    batch_size: int = 32,
+    num_workers: int = 4,
+    output_adata_path: str = './adata_with_features.h5ad'
 ) -> None:
     """
-    Main driver: load image, AnnData, and CSV windows;
-    crop 224×224 patches at each spot center;
-    crop 512×512 & 1024×1024 at CSV-specified top-lefts;
-    extract features in parallel; store in adata.uns; save.
-
-    Args:
-        image_path          (str): path to .tiff
-        adata_path          (str): path to .h5ad
-        windows_csv         (str): path to CSV with columns [sample,window_size,x,y]
-        spatial_scale       (float): scale factor for adata.obsm['spatial']
-        target_dim          (int): final feature dim
-        n_jobs              (int): joblib parallel jobs
-        output_adata_path   (str): where to write updated AnnData
+    Driver using PatchDataset + DataLoader to batch preprocess CPU-side
+    and GPU-forward each homogeneous batch.
     """
     t0 = time.time()
-    print("🔬 Loading image and data...")
-    img   = Image.open(image_path).convert('RGB')
-    ad    = ad.read_h5ad(adata_path)
-    dfwin = pd.read_csv(windows_csv)
+    print("🔬 Loading data...")
+    img_arr = tifffile.imread(image_path)
+    adata = ad.read_h5ad(adata_path)
 
-    print(f"🧬 AnnData: {ad.n_obs} spots, samples: {ad.obs['sample'].nunique()}")
-    print(f"📑 Windows: {len(dfwin)} entries")
+    # preprocessing & model
+    preprocess = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485,0.456,0.406],
+                             std=[0.229,0.224,0.225]),
+    ])
+    resnet = models.resnet50(pretrained=True)
+    backbone = nn.Sequential(*list(resnet.children())[:-1]).eval()
+    reducer = nn.Linear(2048, target_dim).eval()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    backbone.to(device); reducer.to(device)
 
-    # prepare spot-centered tasks
-    spots = ad.obsm['spatial'] * spatial_scale
-    samples = ad.obs['sample'].values
-    tasks_224 = [
-        (img, *model_args, sample, float(xc), float(yc), 224, True)
-        for (model_args, sample, (xc, yc)) in zip(
-            [()] * len(spots),
-            samples,
-            spots
+    # build dataset
+    ds = PatchDataset(img_arr, adata, windows_csv, spatial_scale, preprocess)
+
+    # prepare storage
+    feat_store: Dict[int, Dict[str, np.ndarray]] = {}
+
+    # for each size, create a DataLoader over that subset
+    for size, indices in ds.by_size.items():
+        print(f"▶ Processing patches of size {size} ({len(indices)} total)")
+        loader = DataLoader(
+            ds,
+            batch_size=batch_size,
+            sampler=torch.utils.data.SubsetRandomSampler(indices),
+            collate_fn=collate_homogeneous,
+            num_workers=num_workers,
+            pin_memory=True,
         )
-    ]
-    # Instead of the above zip hack, better:
-    tasks_224 = []
-    for sample, coord in zip(ad.obs['sample'], spots):
-        tasks_224.append((img, ), )  # wrong...
 
-    # Actually build tasks properly below after loading model
+        for batch_idx, (batch_tensor, patch_ids) in enumerate(loader):
+            batch_tensor = batch_tensor.to(device)
+            with torch.no_grad():
+                feats2048 = backbone(batch_tensor).view(batch_tensor.size(0), -1)
+                feats = reducer(feats2048).cpu().numpy()
 
-    # load model once
-    backbone, reducer, preprocess, device = load_model_and_preprocess(target_dim)
+            # store per-patch
+            for pid, fv in zip(patch_ids, feats):
+                feat_store.setdefault(size, {})[pid] = fv
 
-    # build all tasks
-    tasks: List[Tuple] = []
+            if (batch_idx + 1) % 10 == 0:
+                print(f"    processed {batch_idx+1}/{len(loader)} batches")
 
-    # 1) 224×224 centered on each spot
-    for sample, coord in zip(ad.obs['sample'], spots):
-        x_c, y_c = coord
-        tasks.append((img, backbone, reducer, preprocess, device, sample, x_c, y_c, 224, True))
+    # attach to AnnData
+    adata.uns['patch_features'] = {str(sz): feat_store[sz] for sz in sorted(feat_store)}
 
-    # 2) windows from CSV
-    for _, row in dfwin.iterrows():
-        tasks.append((img, backbone, reducer, preprocess, device,
-                      str(row['sample']), int(row['x']), int(row['y']),
-                      int(row['window_size']), False))
-
-    print(f"🚀 Extracting features for {len(tasks)} patches in parallel...")
-    results = Parallel(n_jobs=n_jobs, backend='threading', verbose=5)(
-        delayed(extract_patch_feature)(*task) for task in tasks
-    )
-
-    # filter out any None
-    feats = [r for r in results if r is not None]
-    print(f"✅ Extracted {len(feats)} feature vectors")
-
-    # Organize into dicts per size
-    feat_dict: Dict[int, Dict[str, np.ndarray]] = {}
-    for r in feats:
-        feat_dict.setdefault(r['size'], {})[r['patch_id']] = r['feature']
-
-    # Store into adata.uns
-    ad.uns['patch_features'] = {}
-    for size, d in feat_dict.items():
-        ad.uns['patch_features'][f"{size}"] = d
-
-    # Save updated AnnData
-    print("💾 Writing updated AnnData...")
+    # save
+    print("💾 Saving AnnData...")
     os.makedirs(os.path.dirname(output_adata_path), exist_ok=True)
-    ad.write_h5ad(output_adata_path)
+    adata.write_h5ad(output_adata_path)
 
-    print("🕒 Done in {:.1f}s".format(time.time() - t0))
+    print(f"✅ Finished in {(time.time()-t0):.1f}s")
+    for sz, d in adata.uns['patch_features'].items():
+        print(f"   size {sz}: {len(d)} patches")
 
 
-# Example usage
 if __name__ == "__main__":
     extract_all_features(
-        image_path='./image.tiff',
-        adata_path='./adata.h5ad',
-        windows_csv='./spot_windows.csv',
+        #image_path='/nfs/team361/data/sanger_whole_embryo/aligned_downsampled_2_reg.ome.tif',
+        #adata_path='/nfs/team361/data/sanger_whole_embryo/adata_CS17.h5ad',
+        image_path='//lustre/scratch126/cellgen/lotfollahi/mv10/3d-imputation-data/aligned_downsampled_2_reg.ome.tif',
+        adata_path='//lustre/scratch126/cellgen/lotfollahi/mv10/3d-imputation-data/adata_CS17_2.h5ad',
+        windows_csv='./embryo_data/spot_windows_hits.csv',
         spatial_scale=15.0,
         target_dim=1024,
-        n_jobs=-1,
-        output_adata_path='./adata_with_features.h5ad'
+        batch_size=32,
+        num_workers=8,
+        output_adata_path="./adata_with_features.h5ad"
     )
+
