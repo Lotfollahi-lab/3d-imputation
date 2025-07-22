@@ -1,6 +1,6 @@
 import os
 import time
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -11,6 +11,7 @@ from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 import tifffile
 import anndata as ad
+from tqdm import tqdm
 
 
 class PatchDataset(Dataset):
@@ -36,7 +37,9 @@ class PatchDataset(Dataset):
         self.meta: List[Dict[str, Any]] = []
         half224 = 224 // 2
         coords = (adata.obsm['spatial'] * spatial_scale).astype(int)
-        for sample, (xc, yc) in zip(adata.obs['sample'], coords):
+        # track spot index mapping
+        spot_ids = list(adata.obs.index)
+        for spot_idx, (sample, (xc, yc)) in enumerate(zip(adata.obs['sample'], coords)):
             idx = self.sample_to_idx[sample]
             x0, y0 = xc - half224, yc - half224
             if 0 <= x0 <= self.W - 224 and 0 <= y0 <= self.H - 224:
@@ -46,6 +49,7 @@ class PatchDataset(Dataset):
                     'size': 224,
                     'x': x0,
                     'y': y0,
+                    'spot_id': spot_ids[spot_idx],  # store AnnData obs index
                 })
 
         df = pd.read_csv(windows_csv)
@@ -63,6 +67,7 @@ class PatchDataset(Dataset):
                     'size': sz,
                     'x': x0,
                     'y': y0,
+                    'spot_id': '',  # empty for non-224 patches
                 })
 
         # group for homogeneous batches
@@ -75,7 +80,7 @@ class PatchDataset(Dataset):
     def __len__(self) -> int:
         return len(self.meta)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, str, int, int, int]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, str, int, int, int, Optional[str]]:
         m = self.meta[idx]
         patch = self.img_array[
             m['sample_idx'], m['y']:m['y']+m['size'],
@@ -83,34 +88,43 @@ class PatchDataset(Dataset):
         ]
         img = Image.fromarray(patch)
         tensor = self.preprocess(img)
-        # return tensor plus metadata for obs
-        return tensor, m['sample_id'], m['size'], m['x'], m['y']
+        # return tensor plus metadata including spot_id
+        return tensor, m['sample_id'], m['size'], m['x'], m['y'], m.get('spot_id', '')
 
 
-def collate_homogeneous(batch: List[Tuple[torch.Tensor, str, int, int, int]]
-) -> Tuple[torch.Tensor, List[str], List[int], List[int], List[int]]:
-    imgs, samples, sizes, xs, ys = zip(*batch)
-    return (torch.stack(imgs, 0),
-            list(samples), list(sizes), list(xs), list(ys))
+def collate_homogeneous(
+    batch: List[Tuple[torch.Tensor, str, int, int, int, Optional[str]]]
+) -> Tuple[torch.Tensor, List[str], List[int], List[int], List[int], List[Optional[str]]]:
+    imgs, samples, sizes, xs, ys, spot_ids = zip(*batch)
+    return (
+        torch.stack(imgs, 0),
+        list(samples),
+        list(sizes),
+        list(xs),
+        list(ys),
+        list(spot_ids),
+    )
 
 
 def build_feature_adata(
-    windows_csv: str,
     sample_ids: List[str],
     sizes: List[int],
     xs: List[int],
     ys: List[int],
+    spot_ids: List[Optional[str]],
     features: np.ndarray,
     target_dim: int
 ) -> ad.AnnData:
     """
-    Create a new AnnData where obs has sample_id, size, x, y; obsm['features'] holds matrix.
+    Create a new AnnData where obs has sample_id, size, x, y, spot_id;
+    obsm['features'] holds matrix.
     """
     obs = pd.DataFrame({
         'sample_id': sample_ids,
         'size': sizes,
         'x': xs,
-        'y': ys
+        'y': ys,
+        'spot_id': spot_ids,
     })
     ad_new = ad.AnnData(
         obs = obs,
@@ -154,6 +168,7 @@ def extract_all_features(
     all_sizes:   List[int] = []
     all_xs:      List[int] = []
     all_ys:      List[int] = []
+    all_spot_ids:List[Optional[str]] = []
     all_feats:   List[np.ndarray] = []
 
     # process each size separately
@@ -166,7 +181,7 @@ def extract_all_features(
             num_workers=num_workers,
             pin_memory=True
         )
-        for batch_imgs, samples, sizes, xs, ys in loader:
+        for batch_imgs, samples, sizes, xs, ys, spot_ids in tqdm(loader):
             batch_imgs = batch_imgs.to(device)
             with torch.no_grad():
                 f2048 = backbone(batch_imgs).view(len(batch_imgs), -1)
@@ -176,17 +191,18 @@ def extract_all_features(
             all_sizes.extend(sizes)
             all_xs.extend(xs)
             all_ys.extend(ys)
+            all_spot_ids.extend(spot_ids)
 
     # stack features
     features = np.vstack(all_feats)  # [n_patches, target_dim]
 
     # build and save new AnnData
     ad_out = build_feature_adata(
-        windows_csv,
         all_samples,
         all_sizes,
         all_xs,
         all_ys,
+        all_spot_ids,
         features,
         target_dim
     )
@@ -198,13 +214,10 @@ def extract_all_features(
     print(f"Done in {time.time()-t0:.1f}s. Written {ad_out.n_obs} patches.")
 
 
-
 if __name__ == "__main__":
     extract_all_features(
-        #image_path='/nfs/team361/data/sanger_whole_embryo/aligned_downsampled_2_reg.ome.tif',
-        #adata_path='/nfs/team361/data/sanger_whole_embryo/adata_CS17.h5ad',
-        image_path='//lustre/scratch126/cellgen/lotfollahi/mv10/3d-imputation-data/aligned_downsampled_2_reg.ome.tif',
-        adata_path='//lustre/scratch126/cellgen/lotfollahi/mv10/3d-imputation-data/adata_CS17_2.h5ad',
+        image_path='/nfs/team361/data/sanger_whole_embryo/aligned_downsampled_2_reg.ome.tif',
+        adata_path='/nfs/team361/data/sanger_whole_embryo/adata_CS17.h5ad',
         windows_csv='./embryo_data/spot_windows_hits.csv',
         spatial_scale=15.0,
         target_dim=1024,
