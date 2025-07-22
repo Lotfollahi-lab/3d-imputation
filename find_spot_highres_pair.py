@@ -1,6 +1,6 @@
 import os
 import time
-from typing import List, Tuple, Dict
+from typing import List, Dict, Tuple
 
 import numpy as np
 import pandas as pd
@@ -12,44 +12,59 @@ from tqdm import tqdm
 def process_sample_windows(
     sample_id: str,
     coords: np.ndarray,
+    spot_ids: List[str],
     image_width: int,
     image_height: int,
     window_size: int
 ) -> List[Dict]:
     """
-    Slide non-overlapping windows over the image for one sample and window size,
-    and record windows containing at least one spot.
+    Slide non‐overlapping windows over one sample’s image slice,
+    record windows containing ≥1 spot, along with those spot_ids and a patch_id.
 
     Args:
-        sample_id (str): Sample name
-        coords (np.ndarray): Array of shape (n_spots, 2) with scaled (x, y) coords
-        image_width (int): Image width in pixels
-        image_height (int): Image height in pixels
-        window_size (int): Size of square window (e.g. 512 or 1024)
+        sample_id    (str): Sample name
+        coords        (np.ndarray): (n_spots,2) scaled (x,y) coords
+        spot_ids      (List[str]): length‐n_spots list of spot obs indices
+        image_width  (int): Image width in px
+        image_height (int): Image height in px
+        window_size  (int): Square window size in px
 
     Returns:
-        List[Dict]: Each dict has keys: 'sample', 'window_size', 'x', 'y'
+        List[Dict]: Each dict has:
+          - sample
+          - window_size
+          - x, y (top‐left of window)
+          - patch_id (e.g. "SampleA_512_0_0")
+          - spot_ids (list of obs indices in that window)
     """
     hits: List[Dict] = []
-    # compute grid of top-left corners
+    # grid of top‐left corners
     x_starts = np.arange(0, image_width - window_size + 1, window_size)
     y_starts = np.arange(0, image_height - window_size + 1, window_size)
 
+    # for each window, test full mask
     for y0 in y_starts:
-        # Vectorized mask pre-filter for this row of windows: spots with y in [y0, y0+window_size)
-        y_mask = (coords[:, 1] >= y0) & (coords[:, 1] < y0 + window_size)
+        # quick y‐range filter
+        y_mask = (coords[:,1] >= y0) & (coords[:,1] < y0 + window_size)
         if not y_mask.any():
-            continue  # no spots in any window on this row
-        row_coords = coords[y_mask]
+            continue
         for x0 in x_starts:
-            # check x-range for this window
-            mask = (row_coords[:, 0] >= x0) & (row_coords[:, 0] < x0 + window_size)
+            # full 2D mask for this window
+            mask = (
+                (coords[:,0] >= x0) &
+                (coords[:,0] < x0 + window_size) &
+                y_mask
+            )
             if mask.any():
+                ids_in_window = [spot_ids[i] for i in np.where(mask)[0]]
+                patch_id = f"{sample_id}_{window_size}_{x0}_{y0}"
                 hits.append({
-                    'sample': sample_id,
-                    'window_size': window_size,
-                    'x': int(x0),
-                    'y': int(y0),
+                    'sample':       sample_id,
+                    'window_size':  window_size,
+                    'x':            int(x0),
+                    'y':            int(y0),
+                    'patch_id':     patch_id,
+                    'spot_ids':     ids_in_window
                 })
     return hits
 
@@ -64,60 +79,63 @@ def find_spot_windows(
     output_csv_path: str = './spot_windows.csv'
 ) -> None:
     """
-    Load an AnnData object and, for each sample and each window size,
-    find all 512×512 and 1024×1024 windows that contain at least one spot.
+    Load AnnData, slide windows of given sizes over each sample’s spatial coords,
+    record windows with spots, including their spot_ids and a patch_id, then save CSV.
 
-    Args:
-        adata_path (str): Path to the .h5ad file
-        image_width (int): Width of the full image
-        image_height (int): Height of the full image
-        spatial_scale (float): Scaling factor to apply to raw spatial coords
-        window_sizes (List[int]): List of window sizes to scan
-        n_jobs (int): Number of parallel jobs for joblib (default: -1 uses all cores)
-        output_csv_path (str): Where to save the resulting CSV
+    The CSV will have columns:
+      sample, window_size, x, y, patch_id, spot_ids
+    where spot_ids is a semicolon‐separated list.
     """
-    start_time = time.time()
+    t0 = time.time()
     print("🔬 Loading AnnData...")
     adata = ad.read_h5ad(adata_path)
-    print(f"🧬 Loaded {adata.n_obs} spots across {adata.obs['sample'].nunique()} samples")
+    samples = adata.obs['sample'].unique()
+    print(f"🧬 {adata.n_obs} spots across {len(samples)} samples")
 
-    # Precompute scaled coords per sample
+    # build per‐sample coords and spot_ids
     sample_coords: Dict[str, np.ndarray] = {}
-    for sample in tqdm(adata.obs['sample'].unique(), desc="Extracting sample coords"):
-        mask = adata.obs['sample'] == sample
-        coords = adata[mask].obsm['spatial'] * spatial_scale
+    sample_spot_ids: Dict[str, List[str]] = {}
+    for sample in tqdm(samples, desc="Extracting sample coords"):
+        mask = (adata.obs['sample'] == sample).values
+        coords = adata.obsm['spatial'][mask] * spatial_scale
         sample_coords[sample] = np.asarray(coords)
+        sample_spot_ids[sample] = adata.obs.index[mask].tolist()
 
-    # Build tasks: one task per (sample, window_size)
-    tasks = [
-        (sample, coords, image_width, image_height, ws)
-        for sample, coords in sample_coords.items()
-        for ws in window_sizes
-    ]
-    print(f"🚀 Launching {len(tasks)} parallel tasks "
-          f"({len(sample_coords)} samples × {len(window_sizes)} window sizes)")
+    # prepare parallel tasks
+    tasks = []
+    for sample in samples:
+        coords = sample_coords[sample]
+        ids = sample_spot_ids[sample]
+        for ws in window_sizes:
+            tasks.append((sample, coords, ids, image_width, image_height, ws))
 
-    # Parallel execution
-    results_nested = Parallel(n_jobs=n_jobs, backend='loky', verbose=5)(
+    print(f"🚀 Launching {len(tasks)} tasks "
+          f"({len(samples)} samples × {len(window_sizes)} window sizes)")
+
+    # run in parallel
+    results = Parallel(n_jobs=n_jobs, backend='loky', verbose=5)(
         delayed(process_sample_windows)(*task) for task in tasks
     )
 
-    # Flatten and save
-    all_hits = [hit for sublist in results_nested for hit in sublist]
-    df = pd.DataFrame(all_hits, columns=['sample', 'window_size', 'x', 'y'])
+    # flatten and build DataFrame
+    all_hits = [hit for sub in results for hit in sub]
+    df = pd.DataFrame(all_hits)
+    # convert list to semicolon‐separated string for CSV
+    df['spot_ids'] = df['spot_ids'].apply(lambda lst: ";".join(lst))
+
     os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
     df.to_csv(output_csv_path, index=False)
 
-    elapsed = time.time() - start_time
-    total_windows = sum(
-        ((image_width - ws) // ws + 1) * ((image_height - ws) // ws + 1)
+    elapsed = time.time() - t0
+    total_wins = sum(
+        ((image_width - ws)//ws + 1) * ((image_height - ws)//ws + 1)
         for ws in window_sizes
-        for _ in sample_coords
-    )
+    ) * len(samples)
+
     print("✅ Done!")
-    print(f"   Total windows scanned: {total_windows}")
+    print(f"   Total windows scanned: {total_wins}")
     print(f"   Windows with ≥1 spot: {len(df)}")
-    print(f"   Coverage: {100 * len(df) / total_windows:.2f}%")
+    print(f"   Coverage: {100*len(df)/total_wins:.2f}%")
     print(f"   Results written to: {output_csv_path}")
     print(f"   Elapsed time: {elapsed:.1f}s")
 
@@ -126,7 +144,7 @@ def example_usage():
     IMAGE_WIDTH = 30000
     IMAGE_HEIGHT = 30000
     ADATA_PATH = '/nfs/team361/data/sanger_whole_embryo/adata_CS17.h5ad'
-    OUTPUT_CSV = './embryo_data/spot_windows_hits.csv'
+    OUTPUT_CSV = './embryo_data/spot_windows_hits_new.csv'
     find_spot_windows(
         adata_path=ADATA_PATH,
         image_width=IMAGE_WIDTH,
