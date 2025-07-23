@@ -1,140 +1,116 @@
 import os
 import time
-from typing import Dict, List
+from typing import List, Dict, Any
 
 import numpy as np
 import pandas as pd
 import anndata as ad
 
 
-def aggregate_counts_to_adata(
-    adata1_path: str,
+def aggregate_patch_counts(
+    adata_path: str,
     windows_csv: str,
-    adata2_path: str,
     output_adata_path: str,
-    layer: str = "X"
+    count_layer: str = 'X'
 ) -> None:
     """
-    1) Load adata1 (spots × genes) and windows CSV.
-    2) Compute per-spot counts_224, counts_512, counts_1024.
-    3) Load adata2, copy adata1.var → adata2.var.
-    4) Attach counts_* to adata2.obsm, merge extra CSV columns into adata2.obs.
-    5) Save updated adata2.
+    Load an AnnData (adata_path) and a CSV of patch definitions (windows_csv).  
+    For 512-sized patches:
+      - parse 'spot_ids' as semicolon-separated list of adata.obs_names
+      - sum counts (adata.layers[count_layer] or .X) over those spots
+    For 1024-sized patches:
+      - parse 'spot_ids' as list of 512-patch_ids
+      - sum the previously computed 512-patch counts
+    Build a new AnnData where each obs is one patch (512 or 1024),
+      .X holds the aggregated counts (shape n_patches × n_genes),
+      .var is copied from the input adata,
+      .obs contains all columns from the CSV plus 'count' and 'patch_id', 'size'.
+    Save to output_adata_path.
     """
     t0 = time.time()
-    print("🔬 Loading data...")
-    adata1 = ad.read_h5ad(adata1_path)
+    print("🔬 Loading AnnData and CSV...")
+    adata = ad.read_h5ad(adata_path)
     df = pd.read_csv(windows_csv)
-    adata2 = ad.read_h5ad(adata2_path)
 
-    # Sanity: adata2.obs must include a 'spot_id' column matching adata1.obs_names
-    if 'spot_id' not in adata2.obs.columns:
-        raise ValueError("adata2.obs must have a 'spot_id' column to match spots")
-    spot_index = list(adata2.obs['spot_id'].astype(str))
-    n_spots = len(spot_index)
+    # Fetch count matrix
+    if count_layer in adata.layers:
+        Xmat = adata.layers[count_layer]
+    else:
+        Xmat = adata.X
+    # densify if sparse
+    Xmat = Xmat.toarray() if hasattr(Xmat, 'toarray') else Xmat
 
-    print("📊 Computing counts_224 (raw per-spot counts)...")
-    # Convert X to dense array if sparse
-    X1 = adata1.X.toarray() if hasattr(adata1.X, "toarray") else adata1.X
-    # Build counts_224 in the order of spot_index
-    idx_map = {sid: i for i, sid in enumerate(adata1.obs_names)}
-    order = [idx_map[sid] for sid in spot_index]
-    counts_224 = X1[order, :]  # shape (n_spots, n_genes)
-
-    print("📦 Aggregating 512×512 patch sums...")
-    df512 = df[df['window_size'] == 512].copy()
-    # parse spot_ids list
+    # Prepare 512 patches
+    print("📦 Processing 512-sized patches...")
+    df512 = df[df['size'] == 512].copy()
     df512['spot_list'] = df512['spot_ids'].str.split(';')
-    # compute patch512 → summed vector
+    # predefine 'count' as object dtype so we can store lists
+
     patch512_counts: Dict[str, np.ndarray] = {}
-    for _, row in df512.iterrows():
-        spots = row['spot_list']
-        indices = [idx_map[s] for s in spots]
-        patch512_counts[row['patch_id']] = X1[indices, :].sum(axis=0)
+    for idx, row in df512.iterrows():
+        spots = row['spot_list']  # list of spot_ids
+        # map to adata row indices
+        indices = [adata.obs_names.get_loc(s) for s in spots if s in adata.obs_names]
+        if not indices:
+            vec = np.zeros(adata.n_vars)
+        else:
+            vec = Xmat[indices, :].sum(axis=0)
+        patch512_counts[row['spot_id']] = vec
+        # store the raw list of counts per gene
 
-    # map each spot to its 512 patch
-    spot_to_512patch: Dict[str, str] = {}
-    for _, row in df512.iterrows():
-        pid = row['patch_id']
-        for s in row['spot_list']:
-            spot_to_512patch[s] = pid
-
-    # build counts_512 per spot in adata2 order
-    counts_512 = np.vstack([
-        patch512_counts[spot_to_512patch[sid]]
-        for sid in spot_index
-    ])
-
-    print("📦 Aggregating 1024×1024 patch sums (by grouping 512 patches)...")
-    df1024 = df[df['window_size'] == 1024].copy()
-    # here spot_ids column holds semicolon list of 512-patch_ids
+    # Prepare 1024 patches
+    print("📦 Processing 1024-sized patches...")
+    df1024 = df[df['size'] == 1024].copy()
     df1024['patch512_list'] = df1024['spot_ids'].str.split(';')
-    # compute patch1024 → summed vector
+    # predefine 'count' as object dtype
+
     patch1024_counts: Dict[str, np.ndarray] = {}
-    for _, row in df1024.iterrows():
-        p512 = row['patch512_list']
-        # sum the precomputed 512 counts
-        mats = [patch512_counts[pid] for pid in p512]
-        patch1024_counts[row['patch_id']] = np.vstack(mats).sum(axis=0)
+    for idx, row in df1024.iterrows():
+        pids = row['patch512_list']  # list of 512-patch_ids
+        mats = [patch512_counts[pid] for pid in pids if pid in patch512_counts]
+        if not mats:
+            vec = np.zeros(adata.n_vars)
+        else:
+            vec = np.vstack(mats).sum(axis=0)
+        patch1024_counts[row['spot_id']] = vec
 
-    # map each spot to its 1024 patch
-    # we need the reverse mapping: each 1024 patch contains many 512 patches, each 512 has spots
-    # build a 512patch→spot_list from df512
-    patch512_to_spots = {row['patch_id']: row['spot_list'] for _, row in df512.iterrows()}
-    # now for each 1024 patch, collect all spots
-    spot_to_1024patch: Dict[str, str] = {}
-    for _, row in df1024.iterrows():
-        pid1024 = row['patch_id']
-        sub512 = row['patch512_list']
-        for pid512 in sub512:
-            for s in patch512_to_spots.get(pid512, []):
-                spot_to_1024patch[s] = pid1024
+    # Concatenate df512 + df1024
+    df_all = pd.concat([df512, df1024], axis=0, ignore_index=True)
 
-    # build counts_1024 per spot in adata2 order
-    counts_1024 = np.vstack([
-        patch1024_counts[spot_to_1024patch[sid]]
-        for sid in spot_index
-    ])
+    # Build data matrix for new AnnData
+    print("🔗 Building new AnnData...")
+    counts_list: List[np.ndarray] = []
+    for pid in df_all['spot_id']:
+        if pid in patch512_counts:
+            counts_list.append(patch512_counts[pid])
+        else:
+            counts_list.append(patch1024_counts[pid])
+    X_new = np.vstack(counts_list)  # shape n_patches × n_genes
 
-    # Copy var from adata1 → adata2
-    print("🔧 Copying var (gene metadata)...")
-    adata2.var = adata1.var.copy()
-
-    # Attach counts to adata2.obsm
-    print("📥 Attaching counts to adata2.obsm...")
-    adata2.obsm['counts_224'] = counts_224
-    adata2.obsm['counts_512'] = counts_512
-    adata2.obsm['counts_1024'] = counts_1024
-
-    # Finally, merge any extra CSV columns into adata2.obs
-    print("🧩 Merging extra CSV columns into adata2.obs...")
-    # columns in df not in obs
-    extras = [c for c in df.columns if c not in adata2.obs.columns and c not in
-              ('spot_ids','patch_id','window_size','x','y')]
-    if extras:
-        # need a mapping from spot_id → row(s) in df512 & df1024
-        # we’ll merge per-spot, using spot_to_512patch and spot_to_1024patch
-        merge_df = pd.DataFrame({'spot_id': spot_index})
-        for col in extras:
-            # choose value from df512 if present, else df1024
-            def lookup(sid):
-                pid512 = spot_to_512patch.get(sid)
-                row512 = df512[df512['patch_id']==pid512]
-                if not row512.empty and col in row512:
-                    return row512.iloc[0][col]
-                pid1024 = spot_to_1024patch.get(sid)
-                row1024 = df1024[df1024['patch_id']==pid1024]
-                if not row1024.empty and col in row1024:
-                    return row1024.iloc[0][col]
-                return None
-            merge_df[col] = merge_df['spot_id'].map(lookup)
-        # join into adata2.obs (on spot_id)
-        adata2.obs = adata2.obs.merge(merge_df.drop(columns=[]),
-                                      on='spot_id', how='left', right_index=False)
+    # Create new AnnData
+    ad_new = ad.AnnData(X=X_new)
+    # copy var (gene info)
+    ad_new.var = adata.var.copy()
+    # copy obs from df_all (all CSV columns, including 'count','patch_id','size','spot_ids', etc.)
+    ad_new.obs = df_all.drop(columns=['spot_list', 'patch512_list'], errors='ignore')
 
     # Save
-    print(f"💾 Saving updated AnnData to {output_adata_path}…")
+    print(f"💾 Saving aggregated AnnData to {output_adata_path}...")
     os.makedirs(os.path.dirname(output_adata_path), exist_ok=True)
-    adata2.write_h5ad(output_adata_path)
+    ad_new.write_h5ad(output_adata_path)
+    print(f"✅ Done in {time.time() - t0:.1f}s: {ad_new.n_obs} patches × {ad_new.n_vars} genes.")
 
-    print(f"✅ Done in {time.time()-t0:.1f}s")
+
+def example_usage():
+    ADATA1 = "filtered_adata.h5ad"
+    WINDOWS_CSV = "./embryo_data/spot_windows_hits_hierarchy.csv"
+    OUTPUT = "./adata_counts_hierarchy.h5ad"
+    aggregate_patch_counts(
+        adata_path=ADATA1,
+        windows_csv=WINDOWS_CSV,
+        output_adata_path=OUTPUT
+    )
+
+
+if __name__ == "__main__":
+    example_usage()
