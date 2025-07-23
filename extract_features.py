@@ -58,7 +58,7 @@ class PatchDataset(Dataset):
             if s not in self.sample_to_idx:
                 continue
             idx = self.sample_to_idx[s]
-            sz = int(row['window_size'])
+            sz = int(row['size'])
             x0, y0 = int(row['x']), int(row['y'])
             if 0 <= x0 <= self.W - sz and 0 <= y0 <= self.H - sz:
                 patch_id = f"{s}_{sz}_{x0}_{y0}"
@@ -68,7 +68,6 @@ class PatchDataset(Dataset):
                     'size': sz,
                     'x': x0,
                     'y': y0,
-                    'patch_id': patch_id,
                     'spot_id': patch_id,  # empty for non-224 patches
                 })
 
@@ -220,7 +219,7 @@ if __name__ == "__main__":
     extract_all_features(
         image_path='/nfs/team361/data/sanger_whole_embryo/aligned_downsampled_2_reg.ome.tif',
         adata_path='/nfs/team361/data/sanger_whole_embryo/adata_CS17.h5ad',
-        windows_csv='./embryo_data/spot_windows_hits.csv',
+        windows_csv='./embryo_data/spot_windows_hits_hierarchy.csv',
         spatial_scale=15.0,
         target_dim=1024,
         batch_size=32,
