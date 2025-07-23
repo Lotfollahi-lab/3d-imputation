@@ -61,13 +61,15 @@ class PatchDataset(Dataset):
             sz = int(row['window_size'])
             x0, y0 = int(row['x']), int(row['y'])
             if 0 <= x0 <= self.W - sz and 0 <= y0 <= self.H - sz:
+                patch_id = f"{s}_{sz}_{x0}_{y0}"
                 self.meta.append({
                     'sample_idx': idx,
                     'sample_id': s,
                     'size': sz,
                     'x': x0,
                     'y': y0,
-                    'spot_id': '',  # empty for non-224 patches
+                    'patch_id': patch_id,
+                    'spot_id': patch_id,  # empty for non-224 patches
                 })
 
         # group for homogeneous batches
@@ -146,7 +148,7 @@ def extract_all_features(
 ) -> None:
     t0 = time.time()
     print("🧬 Loading image & AnnData…")
-    #img_arr = tifffile.imread(image_path)
+    img_arr = tifffile.imread(image_path)
     adata = ad.read_h5ad(adata_path)
 
     # preprocessing + model
