@@ -121,7 +121,7 @@ def build_feature_adata(
     obsm['features'] holds matrix.
     """
     obs = pd.DataFrame({
-        'sample_id': sample_ids,
+        'sample': sample_ids,
         'size': sizes,
         'x': xs,
         'y': ys,
