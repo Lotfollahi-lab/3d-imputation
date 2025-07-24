@@ -172,7 +172,7 @@ def example_usage():
         adata_hier_path="../adata_counts_hierarchy_norm.h5ad",
         adata_feat_path="../adata_with_features.h5ad",
         output_dir="../graph_outputs",
-        distance_threshold=700.0
+        distance_threshold=2300.0
     )
 
 
