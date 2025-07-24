@@ -79,7 +79,6 @@ def normalize_multiple_adatas(
     n = len(input_paths)
     if len(output_paths) != n:
         raise ValueError("input_paths and output_paths must have same length")
-
     for i, (inp, outp) in enumerate(zip(input_paths, output_paths), 1):
         print(f"🔬 [{i}/{n}] Loading AnnData from '{inp}'...")
         adata = ad.read_h5ad(inp)

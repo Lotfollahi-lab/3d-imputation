@@ -93,7 +93,8 @@ def aggregate_patch_counts(
     ad_new.var = adata.var.copy()
     # copy obs from df_all (all CSV columns, including 'count','patch_id','size','spot_ids', etc.)
     ad_new.obs = df_all.drop(columns=['spot_list', 'patch512_list'], errors='ignore')
-
+    #save the spatial coordinates
+    ad_new.obsm['spatial'] = ad_new.obs[['x', 'y']].to_numpy()
     # Save
     print(f"💾 Saving aggregated AnnData to {output_adata_path}...")
     os.makedirs(os.path.dirname(output_adata_path), exist_ok=True)

@@ -207,6 +207,7 @@ def extract_all_features(
         features,
         target_dim
     )
+    ad_out.obsm['spatial'] = ad_out.obs[['x', 'y']].to_numpy()
 
     print("Saving output AnnData…")
     os.makedirs(os.path.dirname(output_adata_path), exist_ok=True)
