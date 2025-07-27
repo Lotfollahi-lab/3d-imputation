@@ -1,126 +1,138 @@
+import os
+import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader, Subset
-from torchvision import transforms
 from PIL import Image
-import numpy as np
-from models.graph_construction import calcADJ, extract_submatrix_3D, calcADJ_from_distance_matrix_3D, \
-    build_adj_matrix_with_similarity_and_known_labels, inter_layer_from_distance_matrix
-import os
-import pandas as pd
-import copy
 
-
-def retain_random_rows(labels, retain_ratio=0.5):
-    row_mask = torch.rand(labels.size(0)) < retain_ratio
-    retained_labels = labels * row_mask.unsqueeze(1).to(labels.dtype)
-
-    return retained_labels
+from models.graph_construction import (
+    calcADJ_from_distance_matrix_3D,
+    extract_submatrix_3D,
+    inter_layer_from_distance_matrix,
+    build_adj_matrix_with_similarity_and_known_labels
+)
 
 
 def find_closest_column(target_sequence, tensor):
     target_sequence = torch.tensor(target_sequence)
     distances = torch.norm(tensor - target_sequence, dim=1)
-    closest_index = torch.argmin(distances)
-
-    return closest_index.item()
+    return torch.argmin(distances).item()
 
 
-class ImageGraphDataset(Dataset):
-    def __init__(self, data_infor_path, graph_path, adj_matrix, transform=None, root_path='./ST_Breast'):
-        self.data_list = np.load(data_infor_path, allow_pickle=True).tolist()
-        self.graph = torch.load(graph_path, weights_only=False)
-        self.transform = transform
-        self.name = data_infor_path.split('/')[-1][:-4]
-        self.root_path = root_path
+def retain_random_rows(labels, retain_ratio=0.5):
+    mask = torch.rand(labels.size(0)) < retain_ratio
+    return labels * mask.unsqueeze(1).to(labels.dtype)
 
-        self.layer_512 = self.graph['layer_512'].y
-        self.layer_1024 = self.graph['layer_1024'].y
-        self.adj_matrix = pd.read_csv(adj_matrix)
 
-        # Initialize train_data and test_data
-        self.train_data, self.test_data = self._split_data_by_level()
+class AnnDataImageGraphDataset(Dataset):
+    def __init__(
+        self,
+        adata_224,            # AnnData with .X = 224‑counts, .obs[['x','y','sample']]
+        adata_counts,         # AnnData with .obs['label_512'], .obs['label_1024']
+        adata_features,       # AnnData with .obsm['feature_512'], .obsm['feature_1024']
+        graph_path: str,
+        adj_matrix_path: str,
+        patch_size: int = 224,
+        transform=None,
+        level_split: int = 1,
+        root_path: str = './'
+    ):
+        super().__init__()
+        # --- store inputs ---
+        self.adata_224      = adata_224
+        self.adata_counts   = adata_counts
+        self.adata_features = adata_features
+        self.transform      = transform
+        self.patch_size     = patch_size
+        self.root_path      = root_path
+        self.level_split    = level_split
 
-    def _split_data_by_level(self):
-        train_data = [item for item in self.data_list if item.get('level', 1) == 1]
-        test_data = [item for item in self.data_list if item.get('level', 1) >= 1]
-        return train_data, test_data
+        # --- prepare index list of all spot_ids ---
+        self.spot_ids = list(self.adata_224.obs_names)
+
+        # --- load graph & adjacency ---
+        self.graph      = torch.load(graph_path, weights_only=False)
+        self.adj_matrix = pd.read_csv(adj_matrix_path)
+
+        # --- precompute train/test splits by ‘section_###’ in obs['sample'] ---
+        levels = (
+            self.adata_224.obs['sample']
+            .str.extract(r'section_(\d+)', expand=False)
+            .astype(int)
+        )
+        self.train_idx = [i for i, lvl in enumerate(levels) if lvl == self.level_split]
+        self.test_idx  = [i for i, lvl in enumerate(levels) if lvl >  self.level_split]
 
     def __len__(self):
-        return len(self.data_list)
+        return len(self.spot_ids)
 
     def __getitem__(self, idx):
-        """
-        Here provides code to load HER2 and ST data, please modify when you use it.
-        """
+        spot_id = self.spot_ids[idx]
+        obs     = self.adata_224.obs.loc[spot_id]
 
-        # img_dir = './HER2'
-        # image_path = os.path.join(img_dir, self.data_list[idx]['img_path'])
+        # 1) load & crop image patch around (x,y)
+        slide_name = obs['sample']               # e.g. 'section_001'
+        img_file   = os.path.join(self.root_path, f"{slide_name}.tiff")
+        img        = Image.open(img_file).convert('RGB')
 
-        img_dir = os.path.join(self.root_path, 'cropped_imgs/patch_224')
-        image_path = os.path.join(img_dir, self.data_list[idx]['img_path'].split('/')[-2] + '/' +
-                                  self.data_list[idx]['img_path'].split('/')[-1])
-
-        image = Image.open(image_path).convert('RGB')
+        x, y = obs[['x','y']].values.astype(int)
+        half = self.patch_size // 2
+        patch = img.crop((x-half, y-half, x-half+self.patch_size, y-half+self.patch_size))
         if self.transform:
-            image = self.transform(image)
+            patch = self.transform(patch)
 
-        label = self.data_list[idx]['label']
-        position = self.data_list[idx]['position']
-        feature_1024 = self.data_list[idx]['feature_1024']
-        feature_512 = self.data_list[idx]['feature_512']
+        # 2) gather labels & features
+        label_224   = self.adata_224.X[idx].astype(np.float32)
+        label_512   = self.adata_counts.obs.loc[spot_id, 'label_512'].astype(np.float32)
+        label_1024  = self.adata_counts.obs.loc[spot_id, 'label_1024'].astype(np.float32)
+        feat_512    = self.adata_features.obsm['feature_512'][idx].astype(np.float32)
+        feat_1024   = self.adata_features.obsm['feature_1024'][idx].astype(np.float32)
 
-        # I am not sure why is the reason for this 
-        idx_1024 = find_closest_column(self.data_list[idx]['label_1024'], self.layer_1024)
-        idx_512 = find_closest_column(self.data_list[idx]['label_512'], self.layer_512)
+        # 3) graph indices (closest in embedding space)
+        idx_1024 = find_closest_column(label_1024, self.graph['layer_1024'].y)
+        idx_512  = find_closest_column(label_512, self.graph['layer_512'].y)
 
-        img_name = self.data_list[idx]['img_path'].split('/')
+        # 4) adjacency‑matrix lookup (column name pattern must match your CSV)
+        col_name    = f"{slide_name[:2]}_{spot_id}"
+        idx_matrix  = self.adj_matrix.columns.get_loc(col_name)
 
-        """ """
+        # 5) the slide‑level integer
+        level = int(obs['sample'].split('_')[-1])
 
-        #column_name = f'{img_name[2][:2]}__{img_name[3][:-4]}'
-        column_name = f'{img_name[2][:2]}_{img_name[3][:-4]}'
-
-
-        idx_matrix = self.adj_matrix.columns.get_loc(column_name)
-        # 'level' may indicate the depth or the slide from which this feature was extracted
-        level = self.data_list[idx]['level']
-
-        return image, label.astype(np.float32), position, int(idx_1024), int(idx_512), feature_1024.astype(
-            np.float32), feature_512.astype(np.float32), int(idx_matrix), int(level)
+        return (
+            patch,                                # image tensor
+            label_224,                            # counts @224
+            (x, y),                               # position
+            idx_1024,                             # graph idx 1024
+            idx_512,                              # graph idx 512
+            feat_1024,                            # feature vec 1024
+            feat_512,                             # feature vec 512
+            idx_matrix,                           # adjacency col
+            level                                 # sample level
+        )
 
     def get_train_dataset(self):
-        # this bug exists in the original code
-        # that create the validation set from the train set
-        # in the wrong manner
-        #return Subset(self, range(len(self.train_data)))
-        train_idxs = [
-            idx
-            for idx, item in enumerate(self.data_list)
-            if item.get('level', 1) == 1
-        ]
-        return Subset(self, train_idxs)
+        return Subset(self, self.train_idx)
 
 
+# --- reuse your original collate fns without change ---  
 def collate_fn(batch, adj_matrix, graph, is_weighted=False):
     images, labels, positions, idx_1024_list, idx_512_list, features_1024, features_512, idx_matrix, level = zip(*batch)
-
-    images = torch.stack(images)
-    labels = torch.tensor(labels)
-    positions = torch.tensor(positions)
-
+    images     = torch.stack(images)
+    labels     = torch.tensor(labels)
+    positions  = torch.tensor(positions)
+    # build sub‑matrices exactly as before…
     k = min(np.array(idx_matrix).shape[0], 12)
-    sub_matrix = extract_submatrix_3D(adj_matrix, np.array(idx_matrix))
-    sub_inter_matrix = inter_layer_from_distance_matrix(sub_matrix, positions, k=4)
-
-    adj_sub = calcADJ_from_distance_matrix_3D(sub_matrix, k=k) + sub_inter_matrix
-    adj_sub[adj_sub > 0] = 1
+    sub_matrix      = extract_submatrix_3D(adj_matrix, np.array(idx_matrix))
+    sub_inter_matrix= inter_layer_from_distance_matrix(sub_matrix, positions, k=4)
+    adj_sub         = calcADJ_from_distance_matrix_3D(sub_matrix, k=k) + sub_inter_matrix
+    adj_sub[adj_sub>0] = 1
 
     features_1024 = torch.tensor(features_1024)
-    features_512 = torch.tensor(features_512)
-    idx_1024 = torch.tensor(idx_1024_list)
-    idx_512 = torch.tensor(idx_512_list)
-
-    known_label = retain_random_rows(labels, retain_ratio=0.2)
+    features_512  = torch.tensor(features_512)
+    idx_1024      = torch.tensor(idx_1024_list)
+    idx_512       = torch.tensor(idx_512_list)
+    known_label   = retain_random_rows(labels, retain_ratio=0.2)
 
     adj_propagate = torch.tensor(0)
     if is_weighted:
@@ -128,33 +140,37 @@ def collate_fn(batch, adj_matrix, graph, is_weighted=False):
 
     return images, labels, adj_sub, adj_propagate, positions, idx_1024, idx_512, features_1024, features_512, graph, known_label
 
+
 def collate_fn_result(batch, adj_matrix, graph, is_weighted=False):
     images, labels, positions, idx_1024_list, idx_512_list, features_1024, features_512, idx_matrix, level = zip(*batch)
-
-    images = torch.stack(images)
-    labels = torch.tensor(labels)
+    images    = torch.stack(images)
+    labels    = torch.tensor(labels)
     positions = torch.tensor(positions)
-
     features_1024 = torch.tensor(features_1024)
-    features_512 = torch.tensor(features_512)
-    idx_1024 = torch.tensor(idx_1024_list)
-    idx_512 = torch.tensor(idx_512_list)
+    features_512  = torch.tensor(features_512)
+    idx_1024      = torch.tensor(idx_1024_list)
+    idx_512       = torch.tensor(idx_512_list)
 
-    indices = [i for i, x in enumerate(level) if x > 1]
-    indices_eval = [i for i, x in enumerate(level) if x == 1]
+    indices      = [i for i, lvl in enumerate(level) if lvl > 1]
+    indices_eval = [i for i, lvl in enumerate(level) if lvl == 1]
 
     k = min(np.array(idx_matrix).shape[0]-1, 12)
     num_random_edges = min(np.array(idx_matrix).shape[0]-1, 10)
-    sub_matrix = extract_submatrix_3D(adj_matrix, np.array(idx_matrix))
-    sub_inter_matrix = inter_layer_from_distance_matrix(sub_matrix, positions, k=4)
+    sub_matrix      = extract_submatrix_3D(adj_matrix, np.array(idx_matrix))
+    sub_inter_matrix= inter_layer_from_distance_matrix(sub_matrix, positions, k=4)
 
-    adj_sub = build_adj_matrix_with_similarity_and_known_labels(sub_matrix, indices_eval, k=k, num_random_edges=num_random_edges)+sub_inter_matrix
-    adj_sub[adj_sub > 0] = 1
+    adj_sub = (
+        build_adj_matrix_with_similarity_and_known_labels(
+            sub_matrix, indices_eval, k=k, num_random_edges=num_random_edges
+        )
+        + sub_inter_matrix
+    )
+    adj_sub[adj_sub>0] = 1
 
-    known_label = copy.deepcopy(labels)
-    eval_label = copy.deepcopy(labels)
-    known_label[indices] = 0
-    eval_label[indices_eval] = 0
+    known_label = labels.clone()
+    eval_label  = labels.clone()
+    known_label[indices]      = 0
+    eval_label[indices_eval]  = 0
 
     adj_propagate = torch.tensor(0)
     if is_weighted:
@@ -164,57 +180,64 @@ def collate_fn_result(batch, adj_matrix, graph, is_weighted=False):
     return images, eval_label, adj_sub, adj_propagate, positions, idx_1024, idx_512, features_1024, features_512, graph, known_label, indices, level
 
 
-def create_dataloaders_for_train_file(npy_file_paths, batch_size=32, transform=None, root_path='./ST_Breast_3D'):
+# --- factories for train/result loaders ---
+def create_dataloaders_for_train(
+    adata_224, adata_counts, adata_features,
+    graph_path, adj_matrix_path,
+    batch_size=32, transform=None,
+    patch_size=224, level_split=1, root_path='./'
+):
+    dataset   = AnnDataImageGraphDataset(
+        adata_224, adata_counts, adata_features,
+        graph_path, adj_matrix_path,
+        patch_size=patch_size, transform=transform,
+        level_split=level_split, root_path=root_path
+    )
+    adj_df    = dataset.adj_matrix
+    graph_obj = dataset.graph
 
-    dataloaders = {}
+    def collate(batch):
+        return collate_fn(batch, adj_df, graph_obj, is_weighted=True)
 
-    for npy_file in npy_file_paths:
-        name = npy_file.split('/')[-1][:-4]
-        # graph_path = f"./HER2_3D/3D_graph_data/{name}.pt"
-        # adj_matrix_path = f'./HER2_3D/3D_combined_information/{name}.csv'
-
-        graph_path = os.path.join(root_path, f'3D_graph_data/{name}.pt')
-        adj_matrix_path = os.path.join(root_path, f'3D_combined_information/{name}.csv')
-
-        dataset = ImageGraphDataset(npy_file, graph_path, adj_matrix_path, transform=transform, root_path=root_path)
-        adj_matrix_df = dataset.adj_matrix
-        graph_data = dataset.graph
-
-        def collate_fn_with_params(batch, adj_matrix_dfs=adj_matrix_df, graph_datas=graph_data):
-            return collate_fn(batch, adj_matrix_dfs, graph_datas, is_weighted=True)
-
-        dataloaders[npy_file] = DataLoader(dataset, batch_size=batch_size, shuffle=True,
-                                           collate_fn=collate_fn_with_params)
-
-    return dataloaders
+    return {
+        'train': DataLoader(
+            dataset.get_train_dataset(),
+            batch_size=batch_size, shuffle=True,
+            collate_fn=collate
+        )
+    }
 
 
-def create_dataloaders_for_result_file(npy_file_paths, batch_size=32, transform=None, root_path='./ST_Breast_3D'):
-    dataloaders = {}
-    testloader = {}
-    for npy_file in npy_file_paths:
-        name = npy_file.split('/')[-1][:-4]
-        # graph_path = f"./HER2_3D/3D_graph_data/{name}.pt"
-        # adj_matrix_path = f'./HER2_3D/3D_combined_information/{name}.csv'
+def create_dataloaders_for_result(
+    adata_224, adata_counts, adata_features,
+    graph_path, adj_matrix_path,
+    batch_size=32, transform=None,
+    patch_size=224, level_split=1, root_path='./'
+):
+    dataset = AnnDataImageGraphDataset(
+        adata_224, adata_counts, adata_features,
+        graph_path, adj_matrix_path,
+        patch_size=patch_size, transform=transform,
+        level_split=level_split, root_path=root_path
+    )
+    adj_df    = dataset.adj_matrix
+    graph_obj = dataset.graph
 
-        graph_path = os.path.join(root_path, f'3D_graph_data/{name}.pt')
-        adj_matrix_path = os.path.join(root_path, f'3D_combined_information/{name}.csv')
+    def collate_train(batch):
+        return collate_fn(batch, adj_df, graph_obj, is_weighted=False)
 
-        dataset = ImageGraphDataset(npy_file, graph_path, adj_matrix_path, transform=transform, root_path=root_path)
-        adj_matrix_df = dataset.adj_matrix
-        graph_data = dataset.graph
+    def collate_test(batch):
+        return collate_fn_result(batch, adj_df, graph_obj, is_weighted=False)
 
-        def collate_fn_with_params(batch, adj_matrix_dfs=adj_matrix_df, graph_datas=graph_data):
-            return collate_fn(batch, adj_matrix_dfs, graph_datas, is_weighted=False)
-
-        def collate_fn_test_with_params(batch, adj_matrix_dfs=adj_matrix_df, graph_datas=graph_data):
-            return collate_fn_result(batch, adj_matrix_dfs, graph_datas, is_weighted=False)
-
-        dataloaders[npy_file] = DataLoader(dataset.get_train_dataset(), batch_size=batch_size, shuffle=True,
-                                           collate_fn=collate_fn_with_params)
-
-        testloader[npy_file] = DataLoader(dataset, batch_size=batch_size, shuffle=True,
-                                          collate_fn=collate_fn_test_with_params)
-
-    return dataloaders, testloader
-
+    return {
+        'train': DataLoader(
+            dataset.get_train_dataset(),
+            batch_size=batch_size, shuffle=True,
+            collate_fn=collate_train
+        ),
+        'test': DataLoader(
+            dataset,
+            batch_size=batch_size, shuffle=False,
+            collate_fn=collate_test
+        )
+    }
