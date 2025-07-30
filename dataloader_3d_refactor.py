@@ -49,12 +49,12 @@ class AnnDataImageGraphDataset(Dataset):
         self.patch_size  = patch_size
 
         # 1) load the TIFF volume (T,3,H,W) → (T,H,W,C)
-        '''
+        
         vol = tifffile.imread(tiff_path)
         if vol.ndim == 4 and vol.shape[1] in (1,3,4):
             vol = np.moveaxis(vol, 1, -1)
         self.vol = vol
-        '''
+        
 
         # 2) keep the AnnData objects
         self.adata_224      = adata_224
@@ -75,24 +75,6 @@ class AnnDataImageGraphDataset(Dataset):
         # 3) 224‐resolution labels
         self.labels_224 = adata_224.X.astype(np.float32)
 
-        # 4) **NEW:** map each 224‑spot → its containing 512 & 1024 spot
-        spot_ids_224 = list(adata_224.obs_names)
-        labels_512   = []
-        labels_1024  = []
-        feats_512    = []
-        feats_1024   = []
-
-        # assume adata_features.obs has columns 'containing_512','containing_1024'
-        for sid in tqdm(spot_ids_224):
-            # sid is the index/name of the 224‐spot in adata_224.obs_names
-            c512 = adata_features[adata_features.obs['spot_id']==sid].obs['containing_512'].item()
-            c1024= adata_features[adata_features.obs['spot_id']==sid].obs['containing_1024'].item()
-            # pull counts from adata_counts.obs
-            labels_512.append(adata_counts[adata_counts.obs['spot_id']==c512].X)
-            labels_1024.append(adata_counts[adata_counts.obs['spot_id']==c1024].X)
-            # pull features from adata_features.obsm
-            feats_512.append(adata_features[adata_features.obs['spot_id']==c512].obsm['features'])
-            feats_1024.append(adata_features[adata_features.obs['spot_id']==c1024].obsm['features'])
         # 5) graph & adjacency CSV
         self.graph      = torch.load(graph_path, weights_only=False)
         #self.adj_matrix = pd.read_csv(adj_csv_path)
@@ -112,9 +94,10 @@ class AnnDataImageGraphDataset(Dataset):
         if self.transform:
             img = self.transform(img)
 
+        spot_id = self.adata_224.obs.iloc[idx]['spot_id']
         # gather labels & features
-        c512 = self.adata_features[self.adata_features.obs['spot_id']==si].obs['containing_512'].item()
-        c1024= self.adata_features[self.adata_features.obs['spot_id']==si].obs['containing_1024'].item()
+        c512 = self.adata_features[self.adata_features.obs['spot_id']==spot_id].obs['containing_512'].item()
+        c1024= self.adata_features[self.adata_features.obs['spot_id']==spot_id].obs['containing_1024'].item()
         # pull counts from adata_counts.obs
 
         l224 = self.labels_224[idx]

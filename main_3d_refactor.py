@@ -65,7 +65,7 @@ slide_to_idx  = {s:i for i,s in enumerate(unique_slides)}
 ds = AnnDataImageGraphDataset(
     adata_224, adata_counts, adata_feats,
     args.tiff,
-    os.path.join(args.root_path,'graph_outputs/embryo.pt'),
+    'graph_outputs/embryo.pt',
     os.path.join(args.root_path,'3D_combined_information/adj.csv'),
     spatial_scale=args.spatial_scale,
     patch_size=args.patch_size,
@@ -116,12 +116,12 @@ for train_slides, test_slides in kf.split(unique_slides):
     train_loader = torch.utils.data.DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
         collate_fn=lambda b: collate_fn(b, ds.adj_matrix, ds.graph, True),
-        num_workers=4, pin_memory=True
+        num_workers=0, pin_memory=True
     )
     test_loader = torch.utils.data.DataLoader(
         test_ds, batch_size=args.batch_size, shuffle=False,
         collate_fn=lambda b: collate_fn_result(b, ds.adj_matrix, ds.graph, False),
-        num_workers=4, pin_memory=True
+        num_workers=0, pin_memory=True
     )
 
     # Model & optimizer
