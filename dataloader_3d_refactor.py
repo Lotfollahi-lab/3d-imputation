@@ -1,243 +1,265 @@
-import os
+# dataloader_3d.py
+
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset, DataLoader, Subset
+import tifffile
+from torch.utils.data import Dataset
 from PIL import Image
+from tqdm import tqdm
 
 from models.graph_construction import (
-    calcADJ_from_distance_matrix_3D,
     extract_submatrix_3D,
+    calcADJ_from_distance_matrix_3D,
     inter_layer_from_distance_matrix,
     build_adj_matrix_with_similarity_and_known_labels
 )
 
-
 def find_closest_column(target_sequence, tensor):
-    target_sequence = torch.tensor(target_sequence)
-    distances = torch.norm(tensor - target_sequence, dim=1)
-    return torch.argmin(distances).item()
-
+    target = torch.tensor(target_sequence)
+    dists  = torch.norm(tensor - target, dim=1)
+    return torch.argmin(dists).item()
 
 def retain_random_rows(labels, retain_ratio=0.5):
     mask = torch.rand(labels.size(0)) < retain_ratio
     return labels * mask.unsqueeze(1).to(labels.dtype)
 
-
 class AnnDataImageGraphDataset(Dataset):
+    """
+    Three‐AnnData + multi‐page TIFF loader.
+     - adata_224      → .X, .obs['x','y','sample']
+     - adata_counts   → .obs['label_512','label_1024']
+     - adata_features → .obs['containing_512','containing_1024'], .obsm['feature_512','feature_1024']
+     - TIFF            → shape (T,3,H,W)
+    """
     def __init__(
         self,
-        adata_224,            # AnnData with .X = 224‑counts, .obs[['x','y','sample']]
-        adata_counts,         # AnnData with .obs['label_512'], .obs['label_1024']
-        adata_features,       # AnnData with .obsm['feature_512'], .obsm['feature_1024']
+        adata_224,
+        adata_counts,
+        adata_features,
+        tiff_path: str,
         graph_path: str,
-        adj_matrix_path: str,
+        adj_csv_path: str,
+        spatial_scale: float = 1.0,
         patch_size: int = 224,
-        transform=None,
-        level_split: int = 1,
-        root_path: str = './'
+        transform=None
     ):
         super().__init__()
-        # --- store inputs ---
+        self.transform   = transform
+        self.patch_size  = patch_size
+
+        # 1) load the TIFF volume (T,3,H,W) → (T,H,W,C)
+        '''
+        vol = tifffile.imread(tiff_path)
+        if vol.ndim == 4 and vol.shape[1] in (1,3,4):
+            vol = np.moveaxis(vol, 1, -1)
+        self.vol = vol
+        '''
+
+        # 2) keep the AnnData objects
         self.adata_224      = adata_224
         self.adata_counts   = adata_counts
         self.adata_features = adata_features
-        self.transform      = transform
-        self.patch_size     = patch_size
-        self.root_path      = root_path
-        self.level_split    = level_split
 
-        # --- prepare index list of all spot_ids ---
-        self.spot_ids = list(self.adata_224.obs_names)
+        obs224 = adata_224.obs
+        # map sample names → TIFF slice index
+        samples = list(obs224['sample'].astype(str).unique())
+        self.sample_to_idx = {s:i for i,s in enumerate(samples)}
 
-        # --- load graph & adjacency ---
+        # compute integer coords (scaled)
+        coords        = (adata_224.obsm['spatial'] * spatial_scale).astype(int)
+        self.x_coords = coords[:,0]
+        self.y_coords = coords[:,1]
+        self.sample_idxs = obs224['sample'].astype(str).map(self.sample_to_idx).to_numpy().astype(int)
+
+        # 3) 224‐resolution labels
+        self.labels_224 = adata_224.X.astype(np.float32)
+
+        # 4) **NEW:** map each 224‑spot → its containing 512 & 1024 spot
+        spot_ids_224 = list(adata_224.obs_names)
+        labels_512   = []
+        labels_1024  = []
+        feats_512    = []
+        feats_1024   = []
+
+        # assume adata_features.obs has columns 'containing_512','containing_1024'
+        for sid in tqdm(spot_ids_224):
+            # sid is the index/name of the 224‐spot in adata_224.obs_names
+            c512 = adata_features[adata_features.obs['spot_id']==sid].obs['containing_512'].item()
+            c1024= adata_features[adata_features.obs['spot_id']==sid].obs['containing_1024'].item()
+            # pull counts from adata_counts.obs
+            labels_512.append(adata_counts[adata_counts.obs['spot_id']==c512].X)
+            labels_1024.append(adata_counts[adata_counts.obs['spot_id']==c1024].X)
+            # pull features from adata_features.obsm
+            feats_512.append(adata_features[adata_features.obs['spot_id']==c512].obsm['features'])
+            feats_1024.append(adata_features[adata_features.obs['spot_id']==c1024].obsm['features'])
+        # 5) graph & adjacency CSV
         self.graph      = torch.load(graph_path, weights_only=False)
-        self.adj_matrix = pd.read_csv(adj_matrix_path)
-
-        # --- precompute train/test splits by ‘section_###’ in obs['sample'] ---
-        levels = (
-            self.adata_224.obs['sample']
-            .str.extract(r'section_(\d+)', expand=False)
-            .astype(int)
-        )
-        self.train_idx = [i for i, lvl in enumerate(levels) if lvl == self.level_split]
-        self.test_idx  = [i for i, lvl in enumerate(levels) if lvl >  self.level_split]
+        #self.adj_matrix = pd.read_csv(adj_csv_path)
 
     def __len__(self):
-        return len(self.spot_ids)
+        return len(self.adata_224)
 
     def __getitem__(self, idx):
-        spot_id = self.spot_ids[idx]
-        obs     = self.adata_224.obs.loc[spot_id]
+        # crop patch
+        si = self.sample_idxs[idx]
+        x, y = self.x_coords[idx], self.y_coords[idx]
+        h = w = self.patch_size
+        y0, x0 = y - h//2, x - w//2
 
-        # 1) load & crop image patch around (x,y)
-        slide_name = obs['sample']               # e.g. 'section_001'
-        img_file   = os.path.join(self.root_path, f"{slide_name}.tiff")
-        img        = Image.open(img_file).convert('RGB')
-
-        x, y = obs[['x','y']].values.astype(int)
-        half = self.patch_size // 2
-        patch = img.crop((x-half, y-half, x-half+self.patch_size, y-half+self.patch_size))
+        patch = self.vol[si, y0:y0+h, x0:x0+w, :]
+        img   = Image.fromarray(patch)
         if self.transform:
-            patch = self.transform(patch)
+            img = self.transform(img)
 
-        # 2) gather labels & features
-        label_224   = self.adata_224.X[idx].astype(np.float32)
-        label_512   = self.adata_counts.obs.loc[spot_id, 'label_512'].astype(np.float32)
-        label_1024  = self.adata_counts.obs.loc[spot_id, 'label_1024'].astype(np.float32)
-        feat_512    = self.adata_features.obsm['feature_512'][idx].astype(np.float32)
-        feat_1024   = self.adata_features.obsm['feature_1024'][idx].astype(np.float32)
+        # gather labels & features
+        c512 = self.adata_features[self.adata_features.obs['spot_id']==si].obs['containing_512'].item()
+        c1024= self.adata_features[self.adata_features.obs['spot_id']==si].obs['containing_1024'].item()
+        # pull counts from adata_counts.obs
 
-        # 3) graph indices (closest in embedding space)
-        idx_1024 = find_closest_column(label_1024, self.graph['layer_1024'].y)
-        idx_512  = find_closest_column(label_512, self.graph['layer_512'].y)
+        l224 = self.labels_224[idx]
+        l512 = self.adata_counts[self.adata_counts.obs['spot_id']==c512].X
+        l10  = self.adata_counts[self.adata_counts.obs['spot_id']==c1024].X
+        f512 = self.adata_features[self.adata_features.obs['spot_id']==c512].obsm['features']
+        f10  = self.adata_features[self.adata_features.obs['spot_id']==c1024].obsm['features']
 
-        # 4) adjacency‑matrix lookup (column name pattern must match your CSV)
-        col_name    = f"{slide_name[:2]}_{spot_id}"
-        idx_matrix  = self.adj_matrix.columns.get_loc(col_name)
+        # graph indices
+        idx_1024 = find_closest_column(l10,  self.graph['layer_1024'].y)
+        idx_512  = find_closest_column(l512, self.graph['layer_512'].y)
 
-        # 5) the slide‑level integer
-        level = int(obs['sample'].split('_')[-1])
+        # adjacency lookup by “sample_spotID”
+        spot_id  = self.adata_224.obs_names[idx]
+        sample   = str(self.adata_224.obs['sample'].iloc[idx])
+        col_name = f"{sample}_{spot_id}"
+        midx     = self.adj_matrix.columns.get_loc(col_name)
+
+        # slide index
+        level = si
 
         return (
-            patch,                                # image tensor
-            label_224,                            # counts @224
-            (x, y),                               # position
-            idx_1024,                             # graph idx 1024
-            idx_512,                              # graph idx 512
-            feat_1024,                            # feature vec 1024
-            feat_512,                             # feature vec 512
-            idx_matrix,                           # adjacency col
-            level                                 # sample level
+            img, l224, (x,y),
+            idx_1024, idx_512,
+            f10, f512,
+            midx, level
         )
 
-    def get_train_dataset(self):
-        return Subset(self, self.train_idx)
-
-
-# --- reuse your original collate fns without change ---  
 def collate_fn(batch, adj_matrix, graph, is_weighted=False):
-    images, labels, positions, idx_1024_list, idx_512_list, features_1024, features_512, idx_matrix, level = zip(*batch)
-    images     = torch.stack(images)
-    labels     = torch.tensor(labels)
-    positions  = torch.tensor(positions)
-    # build sub‑matrices exactly as before…
-    k = min(np.array(idx_matrix).shape[0], 12)
-    sub_matrix      = extract_submatrix_3D(adj_matrix, np.array(idx_matrix))
-    sub_inter_matrix= inter_layer_from_distance_matrix(sub_matrix, positions, k=4)
-    adj_sub         = calcADJ_from_distance_matrix_3D(sub_matrix, k=k) + sub_inter_matrix
+    imgs, l224s, poss, idx10s, idx5s, f10s, f5s, midxs, levels = zip(*batch)
+    images    = torch.stack(imgs)
+    labels    = torch.tensor(l224s)
+    positions = torch.tensor(poss)
+
+    idx_arr   = np.array(midxs)
+    k         = min(idx_arr.shape[0], 12)
+    subM      = extract_submatrix_3D(adj_matrix, idx_arr)
+    inter     = inter_layer_from_distance_matrix(subM, positions, k=4)
+    adj_sub   = calcADJ_from_distance_matrix_3D(subM, k=k) + inter
     adj_sub[adj_sub>0] = 1
 
-    features_1024 = torch.tensor(features_1024)
-    features_512  = torch.tensor(features_512)
-    idx_1024      = torch.tensor(idx_1024_list)
-    idx_512       = torch.tensor(idx_512_list)
-    known_label   = retain_random_rows(labels, retain_ratio=0.2)
+    feat10 = torch.tensor(f10s)
+    feat5  = torch.tensor(f5s)
+    i10    = torch.tensor(idx10s)
+    i5     = torch.tensor(idx5s)
+    known  = retain_random_rows(labels, retain_ratio=0.2)
 
-    adj_propagate = torch.tensor(0)
+    prop = torch.tensor(0)
     if is_weighted:
-        adj_propagate = adj_sub * torch.tensor((sub_matrix+1))
+        prop = adj_sub * torch.tensor((subM+1))
 
-    return images, labels, adj_sub, adj_propagate, positions, idx_1024, idx_512, features_1024, features_512, graph, known_label
-
+    return (images, labels, adj_sub, prop,
+            positions, i10, i5, feat10, feat5,
+            graph, known)
 
 def collate_fn_result(batch, adj_matrix, graph, is_weighted=False):
-    images, labels, positions, idx_1024_list, idx_512_list, features_1024, features_512, idx_matrix, level = zip(*batch)
-    images    = torch.stack(images)
-    labels    = torch.tensor(labels)
-    positions = torch.tensor(positions)
-    features_1024 = torch.tensor(features_1024)
-    features_512  = torch.tensor(features_512)
-    idx_1024      = torch.tensor(idx_1024_list)
-    idx_512       = torch.tensor(idx_512_list)
+    imgs, l224s, poss, idx10s, idx5s, f10s, f5s, midxs, levels = zip(*batch)
+    images    = torch.stack(imgs)
+    labels    = torch.tensor(l224s)
+    positions = torch.tensor(poss)
 
-    indices      = [i for i, lvl in enumerate(level) if lvl > 1]
-    indices_eval = [i for i, lvl in enumerate(level) if lvl == 1]
+    feat10 = torch.tensor(f10s)
+    feat5  = torch.tensor(f5s)
+    i10    = torch.tensor(idx10s)
+    i5     = torch.tensor(idx5s)
 
-    k = min(np.array(idx_matrix).shape[0]-1, 12)
-    num_random_edges = min(np.array(idx_matrix).shape[0]-1, 10)
-    sub_matrix      = extract_submatrix_3D(adj_matrix, np.array(idx_matrix))
-    sub_inter_matrix= inter_layer_from_distance_matrix(sub_matrix, positions, k=4)
+    indices      = [i for i, lvl in enumerate(levels) if lvl >  0]
+    indices_eval = [i for i, lvl in enumerate(levels) if lvl == 0]
 
+    idx_arr = np.array(midxs)
+    k       = min(idx_arr.shape[0]-1, 12)
+    subM    = extract_submatrix_3D(adj_matrix, idx_arr)
+    inter   = inter_layer_from_distance_matrix(subM, positions, k=4)
     adj_sub = (
         build_adj_matrix_with_similarity_and_known_labels(
-            sub_matrix, indices_eval, k=k, num_random_edges=num_random_edges
-        )
-        + sub_inter_matrix
+            subM, indices_eval, k=k, num_random_edges=min(idx_arr.shape[0]-1,10)
+        ) + inter
     )
     adj_sub[adj_sub>0] = 1
 
-    known_label = labels.clone()
-    eval_label  = labels.clone()
-    known_label[indices]      = 0
-    eval_label[indices_eval]  = 0
+    known = labels.clone()
+    eval_ = labels.clone()
+    known[indices]      = 0
+    eval_[indices_eval] = 0
 
-    adj_propagate = torch.tensor(0)
+    prop = torch.tensor(0)
     if is_weighted:
-        adj_propagate = adj_sub * torch.tensor((sub_matrix+1))
-    level = torch.tensor(level)
+        prop = adj_sub * torch.tensor((subM+1))
 
-    return images, eval_label, adj_sub, adj_propagate, positions, idx_1024, idx_512, features_1024, features_512, graph, known_label, indices, level
+    return (images, eval_, adj_sub, prop,
+            positions, i10, i5, feat10, feat5,
+            graph, known, indices, torch.tensor(levels))
 
-
-# --- factories for train/result loaders ---
 def create_dataloaders_for_train(
     adata_224, adata_counts, adata_features,
-    graph_path, adj_matrix_path,
-    batch_size=32, transform=None,
-    patch_size=224, level_split=1, root_path='./'
+    tiff_path, graph_path, adj_csv_path,
+    spatial_scale=1.0,
+    batch_size=32, patch_size=224, transform=None
 ):
-    dataset   = AnnDataImageGraphDataset(
+    ds = AnnDataImageGraphDataset(
         adata_224, adata_counts, adata_features,
-        graph_path, adj_matrix_path,
-        patch_size=patch_size, transform=transform,
-        level_split=level_split, root_path=root_path
+        tiff_path, graph_path, adj_csv_path,
+        spatial_scale=spatial_scale,
+        patch_size=patch_size,
+        transform=transform
     )
-    adj_df    = dataset.adj_matrix
-    graph_obj = dataset.graph
-
-    def collate(batch):
-        return collate_fn(batch, adj_df, graph_obj, is_weighted=True)
-
     return {
-        'train': DataLoader(
-            dataset.get_train_dataset(),
-            batch_size=batch_size, shuffle=True,
-            collate_fn=collate
+        'train': torch.utils.data.DataLoader(
+            ds,
+            batch_size=batch_size,
+            shuffle=True,
+            collate_fn=lambda b: collate_fn(b, ds.adj_matrix, ds.graph, True),
+            num_workers=4,
+            pin_memory=True
         )
     }
 
-
 def create_dataloaders_for_result(
     adata_224, adata_counts, adata_features,
-    graph_path, adj_matrix_path,
-    batch_size=32, transform=None,
-    patch_size=224, level_split=1, root_path='./'
+    tiff_path, graph_path, adj_csv_path,
+    spatial_scale=1.0,
+    batch_size=32, patch_size=224, transform=None
 ):
-    dataset = AnnDataImageGraphDataset(
+    ds = AnnDataImageGraphDataset(
         adata_224, adata_counts, adata_features,
-        graph_path, adj_matrix_path,
-        patch_size=patch_size, transform=transform,
-        level_split=level_split, root_path=root_path
+        tiff_path, graph_path, adj_csv_path,
+        spatial_scale=spatial_scale,
+        patch_size=patch_size,
+        transform=transform
     )
-    adj_df    = dataset.adj_matrix
-    graph_obj = dataset.graph
-
-    def collate_train(batch):
-        return collate_fn(batch, adj_df, graph_obj, is_weighted=False)
-
-    def collate_test(batch):
-        return collate_fn_result(batch, adj_df, graph_obj, is_weighted=False)
-
     return {
-        'train': DataLoader(
-            dataset.get_train_dataset(),
-            batch_size=batch_size, shuffle=True,
-            collate_fn=collate_train
+        'train': torch.utils.data.DataLoader(
+            ds,
+            batch_size=batch_size,
+            shuffle=True,
+            collate_fn=lambda b: collate_fn(b, ds.adj_matrix, ds.graph, False),
+            num_workers=4,
+            pin_memory=True
         ),
-        'test': DataLoader(
-            dataset,
-            batch_size=batch_size, shuffle=False,
-            collate_fn=collate_test
+        'test': torch.utils.data.DataLoader(
+            ds,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=lambda b: collate_fn_result(b, ds.adj_matrix, ds.graph, False),
+            num_workers=4,
+            pin_memory=True
         )
     }
