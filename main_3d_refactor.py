@@ -42,7 +42,7 @@ parser.add_argument('--lr_decay',     type=float, default=0.9)
 parser.add_argument('--seed',         type=int, default=1337)
 parser.add_argument('--gpu',          type=str, default='0')
 parser.add_argument('--batch_size',   type=int, default=128)
-parser.add_argument('--spatial_scale',type=float, default=1.0)
+parser.add_argument('--spatial_scale',type=float, default=15.0)
 parser.add_argument('--patch_size',   type=int, default=224)
 args = parser.parse_args()
 
@@ -66,7 +66,7 @@ ds = AnnDataImageGraphDataset(
     adata_224, adata_counts, adata_feats,
     args.tiff,
     'graph_outputs/embryo.pt',
-    os.path.join(args.root_path,'3D_combined_information/adj.csv'),
+    'embryo_data/spot_iou/embryo_iou_results_new_1.csv',
     spatial_scale=args.spatial_scale,
     patch_size=args.patch_size,
     transform=T.Compose([
@@ -115,12 +115,12 @@ for train_slides, test_slides in kf.split(unique_slides):
 
     train_loader = torch.utils.data.DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
-        collate_fn=lambda b: collate_fn(b, ds.adj_matrix, ds.graph, True),
+        collate_fn=lambda b: collate_fn(b, ds.spot_iou, ds.graph, True),
         num_workers=0, pin_memory=True
     )
     test_loader = torch.utils.data.DataLoader(
         test_ds, batch_size=args.batch_size, shuffle=False,
-        collate_fn=lambda b: collate_fn_result(b, ds.adj_matrix, ds.graph, False),
+        collate_fn=lambda b: collate_fn_result(b, ds.spot_iou, ds.graph, False),
         num_workers=0, pin_memory=True
     )
 

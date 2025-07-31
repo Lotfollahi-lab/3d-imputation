@@ -2,6 +2,8 @@ import random
 import torch
 import numpy as np
 from scipy.spatial import distance_matrix, minkowski_distance, distance
+import torch
+import pandas as pd
 
 
 def calcADJ(coord, k=8, distanceType='euclidean', pruneTag='NA'):
@@ -166,3 +168,43 @@ def build_adj_matrix_with_similarity_and_known_labels(feature_matrix, known_labe
             adj_matrix[neighbor, node] = 1
 
     return adj_matrix
+
+
+
+def combined_cosine_iou(
+    features: torch.Tensor,
+    spot_ids: list[str],
+    df: pd.DataFrame
+) -> torch.Tensor:
+    """
+    features: Tensor[N, D]
+    spot_ids: list of length N, unique spot IDs corresponding to rows of `features`
+    df: DataFrame with columns ['spot1_id','spot2_id','iou_score']
+    
+    Returns:
+        Tensor[N, N] where entry (i,j) = cosine_similarity(features[i],features[j]) + iou_score(i,j).
+        If (spot_i, spot_j) not in df, its iou_score is assumed 0.
+    """
+    # 1) normalize for cosine
+    feats = features
+    normed = feats / feats.norm(dim=1, keepdim=True).clamp(min=1e-8)
+    cos_sim = normed @ normed.T                 # [N,N]
+
+    # 2) build IoU matrix
+    N = len(spot_ids)
+    # map spot_id -> row index
+    idx_map = {sid: i for i, sid in enumerate(spot_ids)}
+    iou_mat = torch.zeros(N, N, dtype=cos_sim.dtype, device=cos_sim.device)
+    
+    # only keep the necessary columns
+    for _, row in df[['spot1_id','spot2_id','iou_score']].iterrows():
+        i = idx_map.get(row.spot1_id)
+        j = idx_map.get(row.spot2_id)
+        if i is not None and j is not None:
+            score = float(row.iou_score)
+            iou_mat[i, j] = score
+            iou_mat[j, i] = score   # assume symmetry
+
+    # 3) sum them
+    combined = cos_sim + iou_mat
+    return combined

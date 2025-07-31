@@ -12,8 +12,10 @@ from models.graph_construction import (
     extract_submatrix_3D,
     calcADJ_from_distance_matrix_3D,
     inter_layer_from_distance_matrix,
-    build_adj_matrix_with_similarity_and_known_labels
+    build_adj_matrix_with_similarity_and_known_labels,
+    combined_cosine_iou
 )
+
 
 def find_closest_column(target_sequence, tensor):
     target = torch.tensor(target_sequence)
@@ -39,8 +41,8 @@ class AnnDataImageGraphDataset(Dataset):
         adata_features,
         tiff_path: str,
         graph_path: str,
-        adj_csv_path: str,
-        spatial_scale: float = 1.0,
+        spot_iou_path: str,
+        spatial_scale: float = 15.0,
         patch_size: int = 224,
         transform=None
     ):
@@ -77,7 +79,7 @@ class AnnDataImageGraphDataset(Dataset):
 
         # 5) graph & adjacency CSV
         self.graph      = torch.load(graph_path, weights_only=False)
-        #self.adj_matrix = pd.read_csv(adj_csv_path)
+        self.spot_iou = pd.read_csv(spot_iou_path)
 
     def __len__(self):
         return len(self.adata_224)
@@ -95,6 +97,7 @@ class AnnDataImageGraphDataset(Dataset):
             img = self.transform(img)
 
         spot_id = self.adata_224.obs.iloc[idx]['spot_id']
+        f224 = self.adata_features[self.adata_features.obs['spot_id']==spot_id].obsm['features']
         # gather labels & features
         c512 = self.adata_features[self.adata_features.obs['spot_id']==spot_id].obs['containing_512'].item()
         c1024= self.adata_features[self.adata_features.obs['spot_id']==spot_id].obs['containing_1024'].item()
@@ -110,31 +113,26 @@ class AnnDataImageGraphDataset(Dataset):
         idx_1024 = find_closest_column(l10,  self.graph['layer_1024'].y)
         idx_512  = find_closest_column(l512, self.graph['layer_512'].y)
 
-        # adjacency lookup by “sample_spotID”
-        spot_id  = self.adata_224.obs_names[idx]
-        sample   = str(self.adata_224.obs['sample'].iloc[idx])
-        col_name = f"{sample}_{spot_id}"
-        midx     = self.adj_matrix.columns.get_loc(col_name)
-
         # slide index
         level = si
 
         return (
             img, l224, (x,y),
             idx_1024, idx_512,
-            f10, f512,
-            midx, level
+            f10, f512, f224,
+            spot_id, level
         )
-
-def collate_fn(batch, adj_matrix, graph, is_weighted=False):
-    imgs, l224s, poss, idx10s, idx5s, f10s, f5s, midxs, levels = zip(*batch)
+#section_029_AACTTGCTAACGGTTC-1'
+def collate_fn(batch, spot_iou, graph, is_weighted=False):
+    imgs, l224s, poss, idx10s, idx5s, f10s, f5s, f224s, spot_id, levels = zip(*batch)
     images    = torch.stack(imgs)
     labels    = torch.tensor(l224s)
     positions = torch.tensor(poss)
+    f224 = torch.tensor(f224s)
 
-    idx_arr   = np.array(midxs)
+    idx_arr   = np.array(spot_id)
     k         = min(idx_arr.shape[0], 12)
-    subM      = extract_submatrix_3D(adj_matrix, idx_arr)
+    subM      = combined_cosine_iou(f224, spot_id, spot_iou)
     inter     = inter_layer_from_distance_matrix(subM, positions, k=4)
     adj_sub   = calcADJ_from_distance_matrix_3D(subM, k=k) + inter
     adj_sub[adj_sub>0] = 1
@@ -153,11 +151,12 @@ def collate_fn(batch, adj_matrix, graph, is_weighted=False):
             positions, i10, i5, feat10, feat5,
             graph, known)
 
-def collate_fn_result(batch, adj_matrix, graph, is_weighted=False):
-    imgs, l224s, poss, idx10s, idx5s, f10s, f5s, midxs, levels = zip(*batch)
+def collate_fn_result(batch, spot_iou, graph, is_weighted=False):
+    imgs, l224s, poss, idx10s, idx5s, f10s, f5s, f224s, spot_id, levels = zip(*batch)
     images    = torch.stack(imgs)
     labels    = torch.tensor(l224s)
     positions = torch.tensor(poss)
+    f224 = torch.tensor(f224s)
 
     feat10 = torch.tensor(f10s)
     feat5  = torch.tensor(f5s)
@@ -167,9 +166,9 @@ def collate_fn_result(batch, adj_matrix, graph, is_weighted=False):
     indices      = [i for i, lvl in enumerate(levels) if lvl >  0]
     indices_eval = [i for i, lvl in enumerate(levels) if lvl == 0]
 
-    idx_arr = np.array(midxs)
+    idx_arr = np.array(spot_id)
     k       = min(idx_arr.shape[0]-1, 12)
-    subM    = extract_submatrix_3D(adj_matrix, idx_arr)
+    subM    = combined_cosine_iou(f224, spot_id, spot_iou)
     inter   = inter_layer_from_distance_matrix(subM, positions, k=4)
     adj_sub = (
         build_adj_matrix_with_similarity_and_known_labels(
@@ -193,13 +192,13 @@ def collate_fn_result(batch, adj_matrix, graph, is_weighted=False):
 
 def create_dataloaders_for_train(
     adata_224, adata_counts, adata_features,
-    tiff_path, graph_path, adj_csv_path,
-    spatial_scale=1.0,
+    tiff_path, graph_path, spot_iou_path,
+    spatial_scale=15.0,
     batch_size=32, patch_size=224, transform=None
 ):
     ds = AnnDataImageGraphDataset(
         adata_224, adata_counts, adata_features,
-        tiff_path, graph_path, adj_csv_path,
+        tiff_path, graph_path, spot_iou_path,
         spatial_scale=spatial_scale,
         patch_size=patch_size,
         transform=transform
@@ -209,7 +208,7 @@ def create_dataloaders_for_train(
             ds,
             batch_size=batch_size,
             shuffle=True,
-            collate_fn=lambda b: collate_fn(b, ds.adj_matrix, ds.graph, True),
+            collate_fn=lambda b: collate_fn(b, ds.spot_iou, ds.graph, True),
             num_workers=4,
             pin_memory=True
         )
@@ -217,13 +216,13 @@ def create_dataloaders_for_train(
 
 def create_dataloaders_for_result(
     adata_224, adata_counts, adata_features,
-    tiff_path, graph_path, adj_csv_path,
-    spatial_scale=1.0,
+    tiff_path, graph_path, spot_iou_path,
+    spatial_scale=15.0,
     batch_size=32, patch_size=224, transform=None
 ):
     ds = AnnDataImageGraphDataset(
         adata_224, adata_counts, adata_features,
-        tiff_path, graph_path, adj_csv_path,
+        tiff_path, graph_path, spot_iou_path,
         spatial_scale=spatial_scale,
         patch_size=patch_size,
         transform=transform
@@ -233,7 +232,7 @@ def create_dataloaders_for_result(
             ds,
             batch_size=batch_size,
             shuffle=True,
-            collate_fn=lambda b: collate_fn(b, ds.adj_matrix, ds.graph, False),
+            collate_fn=lambda b: collate_fn(b, ds.spot_iou, ds.graph, False),
             num_workers=4,
             pin_memory=True
         ),
@@ -241,7 +240,7 @@ def create_dataloaders_for_result(
             ds,
             batch_size=batch_size,
             shuffle=False,
-            collate_fn=lambda b: collate_fn_result(b, ds.adj_matrix, ds.graph, False),
+            collate_fn=lambda b: collate_fn_result(b, ds.spot_iou, ds.graph, False),
             num_workers=4,
             pin_memory=True
         )
