@@ -170,6 +170,8 @@ def build_adj_matrix_with_similarity_and_known_labels(feature_matrix, known_labe
     return adj_matrix
 
 
+import torch
+import numpy as np
 
 def combined_cosine_iou(
     features: torch.Tensor,
@@ -177,34 +179,46 @@ def combined_cosine_iou(
     df: pd.DataFrame
 ) -> torch.Tensor:
     """
-    features: Tensor[N, D]
-    spot_ids: list of length N, unique spot IDs corresponding to rows of `features`
+    features: (N, D) float Tensor
+    spot_ids: list of length N, each the ID string for features[i]
     df: DataFrame with columns ['spot1_id','spot2_id','iou_score']
     
-    Returns:
-        Tensor[N, N] where entry (i,j) = cosine_similarity(features[i],features[j]) + iou_score(i,j).
-        If (spot_i, spot_j) not in df, its iou_score is assumed 0.
+    Returns (N, N) Tensor: cos_sim + iou, with:
+      - diagonal entries set to 0
+      - entries for pairs from the same sample set to 0
     """
-    # 1) normalize for cosine
-    feats = features
-    normed = feats / feats.norm(dim=1, keepdim=True).clamp(min=1e-8)
-    cos_sim = normed @ normed.T                 # [N,N]
+    # 1) Cosine similarity
+    norm = features / features.norm(dim=1, keepdim=True).clamp(min=1e-8)
+    cos_sim = norm @ norm.T                # [N, N]
 
-    # 2) build IoU matrix
-    N = len(spot_ids)
-    # map spot_id -> row index
+    # 2) IoU matrix (vectorized)
+    N = features.shape[0]
     idx_map = {sid: i for i, sid in enumerate(spot_ids)}
-    iou_mat = torch.zeros(N, N, dtype=cos_sim.dtype, device=cos_sim.device)
-    
-    # only keep the necessary columns
-    for _, row in df[['spot1_id','spot2_id','iou_score']].iterrows():
-        i = idx_map.get(row.spot1_id)
-        j = idx_map.get(row.spot2_id)
-        if i is not None and j is not None:
-            score = float(row.iou_score)
-            iou_mat[i, j] = score
-            iou_mat[j, i] = score   # assume symmetry
+    i_series = df['spot1_id'].map(idx_map)
+    j_series = df['spot2_id'].map(idx_map)
+    valid = i_series.notna() & j_series.notna()
+    i_idx = i_series[valid].astype(int).to_numpy()
+    j_idx = j_series[valid].astype(int).to_numpy()
+    scores = df.loc[valid, 'iou_score'].to_numpy()
 
-    # 3) sum them
+    iou_mat = torch.zeros(N, N, dtype=cos_sim.dtype, device=cos_sim.device)
+    iou_vals = torch.from_numpy(scores).to(cos_sim.device).to(cos_sim.dtype)
+    iou_mat[i_idx, j_idx] = iou_vals
+    iou_mat[j_idx, i_idx] = iou_vals  # symmetry
+
+    # 3) Combine
     combined = cos_sim + iou_mat
+
+    # 4) Zero diagonal
+    combined.fill_diagonal_(0)
+
+    # 5) Zero entries for same-sample pairs
+    #    assume sample prefix is first two underscore-separated parts: "section_022"
+    samples = [ "_".join(sid.split("_")[:2]) for sid in spot_ids ]
+    samples_arr = np.array(samples)
+    same_sample = torch.from_numpy(
+        (samples_arr[:, None] == samples_arr[None, :]).astype(bool)
+    ).to(combined.device)
+    combined.masked_fill_(same_sample, 0)
+
     return combined

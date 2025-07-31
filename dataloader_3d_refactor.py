@@ -126,9 +126,9 @@ class AnnDataImageGraphDataset(Dataset):
 def collate_fn(batch, spot_iou, graph, is_weighted=False):
     imgs, l224s, poss, idx10s, idx5s, f10s, f5s, f224s, spot_id, levels = zip(*batch)
     images    = torch.stack(imgs)
-    labels    = torch.tensor(l224s)
-    positions = torch.tensor(poss)
-    f224 = torch.tensor(f224s)
+    labels    = torch.tensor(np.array(l224s))
+    positions = torch.tensor(np.array(poss))
+    f224 = torch.tensor(np.array(f224s).squeeze(1))
 
     idx_arr   = np.array(spot_id)
     k         = min(idx_arr.shape[0], 12)
@@ -154,9 +154,9 @@ def collate_fn(batch, spot_iou, graph, is_weighted=False):
 def collate_fn_result(batch, spot_iou, graph, is_weighted=False):
     imgs, l224s, poss, idx10s, idx5s, f10s, f5s, f224s, spot_id, levels = zip(*batch)
     images    = torch.stack(imgs)
-    labels    = torch.tensor(l224s)
-    positions = torch.tensor(poss)
-    f224 = torch.tensor(f224s)
+    labels    = torch.tensor(np.array(l224s))
+    positions = torch.tensor(np.array(poss))
+    f224 = torch.tensor(np.array(f224s).squeeze(1))
 
     feat10 = torch.tensor(f10s)
     feat5  = torch.tensor(f5s)
