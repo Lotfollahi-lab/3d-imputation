@@ -65,9 +65,8 @@ class gs_block_with_attention_fixed_weights(nn.Module):
             att_scores = F.softmax(att_scores, dim=0)
 
             num_neigh = adj.sum(1, keepdim=True)
-            mask = adj.div(num_neigh)
-            weighted_feats = mask * att_scores.unsqueeze(1)
-            to_feats = weighted_feats.mm(x)
+            attended_x = att_scores.unsqueeze(1) * x  # [num_nodes, feat_dim]
+            to_feats = adj.mm(attended_x) / num_neigh  # Direct sparse matrix multiplication
 
         elif self.policy == 'mean':
             num_neigh = adj.sum(1, keepdim=True)

@@ -40,12 +40,32 @@ class GNNTransformerBlock(nn.Module):
         # Add positional encoding to each GNN layer's output to help Transformer distinguish layers
         gnn_outputs += self.positional_encoding.unsqueeze(0).repeat(batch_size * num_nodes, 1, 1)
 
-        # Use Transformer to aggregate features across layers
-        transformer_output = self.transformer_encoder(gnn_outputs)
-        final_output = transformer_output.mean(dim=1)
+        # Split into 3 chunks and process separately
+        chunk_num = 10
+        chunk_size = gnn_outputs.size(0) // chunk_num
+        remainder = gnn_outputs.size(0) % chunk_num
+
+        # Calculate chunk boundaries
+        chunks = []
+        start_idx = 0
+
+        for i in range(chunk_num):
+            # Add remainder to first chunks if needed
+            current_chunk_size = chunk_size + (1 if i < remainder else 0)
+            end_idx = start_idx + current_chunk_size
+        
+            # Process chunk through transformer
+            chunk_input = gnn_outputs[start_idx:end_idx]
+            chunk_output = self.transformer_encoder(chunk_input)
+            chunk_final = chunk_output.mean(dim=1)
+        
+            chunks.append(chunk_final)
+            start_idx = end_idx
+
+        # Concatenate all chunks back together
+        final_output = torch.cat(chunks, dim=0)
         final_output = final_output.view(num_nodes, dim)
         return final_output
-
 
 class CrossAttention(nn.Module):
     def __init__(self, dim, num_heads=8, dropout=0.1):

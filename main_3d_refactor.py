@@ -29,6 +29,10 @@ from dataloader_3d_refactor import (
     collate_fn, collate_fn_result
 )
 
+from torch.amp import autocast, GradScaler
+#import torch.multiprocessing as mp
+#mp.set_start_method("spawn", force=True)
+
 parser = argparse.ArgumentParser()
 parser.add_argument('--adata_224',    type=str, required=True)
 parser.add_argument('--adata_counts', type=str, required=True)
@@ -44,6 +48,8 @@ parser.add_argument('--gpu',          type=str, default='0')
 parser.add_argument('--batch_size',   type=int, default=128)
 parser.add_argument('--spatial_scale',type=float, default=15.0)
 parser.add_argument('--patch_size',   type=int, default=224)
+parser.add_argument('--fp16', action='store_true', help='Enable mixed precision (fp16) training')
+parser.add_argument('--num_workers', type=int, default=10)
 args = parser.parse_args()
 
 # Setup
@@ -93,6 +99,9 @@ logging.basicConfig(
 logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
 logging.info(str(args))
 
+# AMP scaler (if needed)
+scaler = GradScaler() if args.fp16 else None
+
 metrics = {'mse':[], 'mae':[], 'pcc':[]}
 fold = 0
 
@@ -116,12 +125,12 @@ for train_slides, test_slides in kf.split(unique_slides):
     train_loader = torch.utils.data.DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
         collate_fn=lambda b: collate_fn(b, ds.spot_iou, ds.graph, True),
-        num_workers=0, pin_memory=True
+        num_workers=args.num_workers, pin_memory=True
     )
     test_loader = torch.utils.data.DataLoader(
         test_ds, batch_size=args.batch_size, shuffle=False,
         collate_fn=lambda b: collate_fn_result(b, ds.spot_iou, ds.graph, False),
-        num_workers=0, pin_memory=True
+        num_workers=args.num_workers, pin_memory=True
     )
 
     # Model & optimizer
@@ -132,14 +141,14 @@ for train_slides, test_slides in kf.split(unique_slides):
     iter_num = 0
     max_epoch = 51
 
-    for epoch in range(1, max_epoch+1):
+    for epoch in tqdm(range(1, max_epoch+1), desc=f"Fold {fold}"):
         model.train()
         for (
             images, labels, adj_sub, adj_prop,
             positions, idx_1024, idx_512,
             features_1024, features_512,
             graph_torch, known_label
-        ) in train_loader:
+        ) in tqdm(train_loader, desc=f"Fold {fold} Epoch {epoch}"):
             # adjust LR
             for g in optimizer.param_groups:
                 g['lr'] = args.base_lr * (1 - iter_num/args.max_iters)**args.lr_decay
@@ -158,21 +167,35 @@ for train_slides, test_slides in kf.split(unique_slides):
             ]
             batch_data = [d.to(device) for d in batch_data]
 
-            pred, p512, p1024 = model(*batch_data)
-            p512c = p512.cpu()[idx_512.cpu()]
-            p1024c= p1024.cpu()[idx_1024.cpu()]
-
-            loss_other = pcc_loss(g512.y.to(device), p512) \
-                       + pcc_loss(g1024.y.to(device), p1024)
-            loss_cons  = pcc_loss(p512c.to(device), labels.to(device)) \
-                       + pcc_loss(p1024c.to(device), labels.to(device))
-            loss_spot  = 0.75*nn.MSELoss()(pred, labels.to(device)) \
-                       + 0.25*pcc_loss(pred, labels.to(device))
-            loss = loss_spot + 0.125*loss_other + 0.125*loss_cons
-
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            if args.fp16:
+                with autocast('cuda'):
+                    pred, p512, p1024 = model(*batch_data)
+                    p512c = p512.cpu()[idx_512.cpu()]
+                    p1024c= p1024.cpu()[idx_1024.cpu()]
+                    loss_other = pcc_loss(g512.y.to(device), p512) \
+                               + pcc_loss(g1024.y.to(device), p1024)
+                    loss_cons  = pcc_loss(p512c.to(device), labels.to(device)) \
+                               + pcc_loss(p1024c.to(device), labels.to(device))
+                    loss_spot  = 0.75*nn.MSELoss()(pred, labels.to(device)) \
+                               + 0.25*pcc_loss(pred, labels.to(device))
+                    loss = loss_spot + 0.125*loss_other + 0.125*loss_cons
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                pred, p512, p1024 = model(*batch_data)
+                p512c = p512.cpu()[idx_512.cpu()]
+                p1024c= p1024.cpu()[idx_1024.cpu()]
+                loss_other = pcc_loss(g512.y.to(device), p512) \
+                           + pcc_loss(g1024.y.to(device), p1024)
+                loss_cons  = pcc_loss(p512c.to(device), labels.to(device)) \
+                           + pcc_loss(p1024c.to(device), labels.to(device))
+                loss_spot  = 0.75*nn.MSELoss()(pred, labels.to(device)) \
+                           + 0.25*pcc_loss(pred, labels.to(device))
+                loss = loss_spot + 0.125*loss_other + 0.125*loss_cons
+                loss.backward()
+                optimizer.step()
 
             iter_num += 1
             writer.add_scalar('lr', optimizer.param_groups[0]['lr'], iter_num)

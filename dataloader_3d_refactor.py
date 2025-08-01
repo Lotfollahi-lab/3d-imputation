@@ -52,11 +52,9 @@ class AnnDataImageGraphDataset(Dataset):
 
         # 1) load the TIFF volume (T,3,H,W) → (T,H,W,C)
         
-        vol = tifffile.imread(tiff_path)
-        if vol.ndim == 4 and vol.shape[1] in (1,3,4):
-            vol = np.moveaxis(vol, 1, -1)
-        self.vol = vol
-        
+        self.vol = tifffile.imread(tiff_path)
+        if self.vol.ndim == 4 and self.vol.shape[1] in (1,3,4):
+            self.vol = np.moveaxis(self.vol, 1, -1)        
 
         # 2) keep the AnnData objects
         self.adata_224      = adata_224
@@ -137,15 +135,16 @@ def collate_fn(batch, spot_iou, graph, is_weighted=False):
     adj_sub   = calcADJ_from_distance_matrix_3D(subM, k=k) + inter
     adj_sub[adj_sub>0] = 1
 
-    feat10 = torch.tensor(f10s)
-    feat5  = torch.tensor(f5s)
+    feat10 = torch.tensor(np.array(f10s).squeeze(1))
+    feat5  = torch.tensor(np.array(f5s).squeeze(1))
     i10    = torch.tensor(idx10s)
     i5     = torch.tensor(idx5s)
     known  = retain_random_rows(labels, retain_ratio=0.2)
 
     prop = torch.tensor(0)
     if is_weighted:
-        prop = adj_sub * torch.tensor((subM+1))
+        prop = adj_sub * (subM + 1).detach().clone()       # good
+
 
     return (images, labels, adj_sub, prop,
             positions, i10, i5, feat10, feat5,
@@ -184,7 +183,7 @@ def collate_fn_result(batch, spot_iou, graph, is_weighted=False):
 
     prop = torch.tensor(0)
     if is_weighted:
-        prop = adj_sub * torch.tensor((subM+1))
+        prop = adj_sub * (subM + 1).detach().clone()       # good
 
     return (images, eval_, adj_sub, prop,
             positions, i10, i5, feat10, feat5,

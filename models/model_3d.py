@@ -11,7 +11,7 @@ from .bs_block_3d import gs_block_with_attention_fixed_weights_3d
 
 class ST_GTC_3d(nn.Module):
     def __init__(self, encoder_output=1024, num_heads=8, cross_attention_dim=1024, dropout=0.1, transformer_dim=1024,
-                 gcn=True, gs_dim=1024, policy='mean', gs_depth=3, gene_output=250):
+                 gcn=True, gs_dim=1024, policy='mean', gs_depth=2, gene_output=250):
         super(ST_GTC_3d, self).__init__()
         self.num_heads = num_heads
 
@@ -28,7 +28,8 @@ class ST_GTC_3d(nn.Module):
         self.gat_layer_1024 = nn.ModuleList(
             [gs_block_with_attention_fixed_weights(gs_dim, gs_dim, policy, gcn) for i in range(gs_depth)])
 
-        self.transformer = GNNTransformerBlock(transformer_dim, dropout=dropout, num_heads=num_heads)
+        self.transformer = GNNTransformerBlock(transformer_dim, dropout=dropout, num_heads=num_heads, 
+                                               num_layers=gs_depth)
 
         self.gene_head_250 = nn.Sequential(
             nn.LayerNorm(transformer_dim),
@@ -64,7 +65,6 @@ class ST_GTC_3d(nn.Module):
         g_1024 = torch.cat(graph_x_1024, 0)
         g_1024_t = self.transformer(g_1024)
         n_1024 = g_1024_t.shape[0]
-
         graph_x_512 = []
         for layer in self.gat_layer_512:
             g = layer(graph_512, adj_512)
@@ -73,7 +73,6 @@ class ST_GTC_3d(nn.Module):
         g_512 = torch.cat(graph_x_512, 0)
         g_512_t = self.transformer(torch.cat((g_1024, g_512), dim=1))[n_1024:, :]
         n_512 = g_512_t.shape[0]
-
         graph_x_224 = []
         label_propagations = []
 
