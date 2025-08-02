@@ -212,6 +212,7 @@ if __name__ == "__main__":
                     if iter_num >= max_iterations:
                         break
                     time1 = time.time()
+                    break
 
             if epoch_num % 10 == 0:
                 model.eval()

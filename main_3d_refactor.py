@@ -51,6 +51,7 @@ parser.add_argument('--spatial_scale',type=float, default=15.0)
 parser.add_argument('--patch_size',   type=int, default=224)
 parser.add_argument('--fp16', action='store_true', help='Enable mixed precision (fp16) training')
 parser.add_argument('--num_workers', type=int, default=10)
+parser.add_argument('--save_path', type=str, default='./weight/ours')
 args = parser.parse_args()
 
 # Setup
@@ -85,7 +86,7 @@ n_slides = len(unique_slides)
 kf = KFold(n_splits=args.n_splits, shuffle=True, random_state=args.seed)
 
 # Logging
-save_path = './weight/ours'
+save_path = args.save_path
 os.makedirs(save_path, exist_ok=True)
 logging.basicConfig(
     filename=os.path.join(save_path,'log.txt'),
@@ -168,7 +169,7 @@ for train_slides, test_slides in kf.split(unique_slides):
 
             optimizer.zero_grad()
             if args.fp16:
-                with autocast('cuda'):
+                with autocast('cuda',dtype=torch.float16):
                     pred, p512, p1024 = model(*batch_data)
                     p512c = p512.cpu()[idx_512.cpu()]
                     p1024c= p1024.cpu()[idx_1024.cpu()]
@@ -200,7 +201,7 @@ for train_slides, test_slides in kf.split(unique_slides):
             writer.add_scalar('lr', optimizer.param_groups[0]['lr'], iter_num)
             writer.add_scalar('loss', loss.item(), iter_num)
             logging.info(f"iter {iter_num} — loss {loss.item():.4f}")
-
+            break
             if iter_num >= args.max_iters:
                 break
         if iter_num >= args.max_iters:
@@ -219,7 +220,7 @@ for train_slides, test_slides in kf.split(unique_slides):
         logging.info(f"Saved model after epoch {epoch}")
 
         # Evaluation every 10 epochs and last epoch
-        if epoch % 10 == 0 or epoch == max_epoch:
+        if epoch % 1 == 0 or epoch == max_epoch:
             model.eval()
             val_loss = val_mae = val_pcc = total = 0
             with torch.no_grad():
@@ -243,13 +244,19 @@ for train_slides, test_slides in kf.split(unique_slides):
                     ]
                     batch_data = [d.to(device) for d in batch_data]
 
-                    pred, _, _ = model(*batch_data)
-                    idxs = torch.tensor(indices, device=device)
+                    if args.fp16:
+                        with autocast('cuda',dtype=torch.float16):
+                            pred, _, _ = model(*batch_data)
+                            idxs = torch.tensor(indices)
+                            loss = nn.MSELoss()(pred.cpu()[idxs], labels[idxs])
+                    else:
+                        pred, _, _ = model(*batch_data)
+                        idxs = torch.tensor(indices)
+                        loss = nn.MSELoss()(pred.cpu()[idxs], labels[idxs])
 
-                    loss = nn.MSELoss()(pred[idxs], labels[idxs].to(device))
                     val_loss += loss.item() * len(indices)
-                    val_mae  += (pred[idxs].cpu() - labels[idxs].cpu()).abs().mean().item() * len(indices)
-                    val_pcc  += calculate_pcc(pred[idxs], labels[idxs].to(device)).item() * len(indices)
+                    val_mae  += (pred.cpu()[idxs] - labels[idxs]).abs().mean().item() * len(indices)
+                    val_pcc  += calculate_pcc(pred.cpu()[idxs], labels[idxs]).item() * len(indices)
                     total    += len(indices)
 
             fold_mse = val_loss/total

@@ -241,7 +241,7 @@ def create_dataloaders_for_result(
         'test': torch.utils.data.DataLoader(
             ds,
             batch_size=batch_size,
-            shuffle=False,
+            shuffle=True,
             collate_fn=lambda b: collate_fn_result(b, ds.spot_iou, ds.graph, False, train_slides),
             num_workers=4,
             pin_memory=True
