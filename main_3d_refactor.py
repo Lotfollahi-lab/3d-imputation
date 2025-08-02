@@ -14,6 +14,7 @@ from torch.utils.data import Subset
 import torchvision.transforms as T
 from tqdm import tqdm
 from tensorboardX import SummaryWriter
+import anndata as ad
 
 import numpy as np
 import pandas as pd
@@ -58,18 +59,13 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 cudnn.benchmark = True
 random.seed(args.seed); torch.manual_seed(args.seed)
 
-# Load AnnData
-adata_224    = sc.read_h5ad(args.adata_224)
-adata_counts = sc.read_h5ad(args.adata_counts)
-adata_feats  = sc.read_h5ad(args.adata_feats)
-
-# Prepare slide‐to‐index mapping
-unique_slides = list(adata_224.obs['sample'].astype(str).unique())
-slide_to_idx  = {s:i for i,s in enumerate(unique_slides)}
+# Instead, get unique slides from AnnData file (efficiently)
+adata_224_obs = ad.read_h5ad(args.adata_224, backed='r').obs
+unique_slides = list(adata_224_obs['sample'].astype(str).unique())
 
 # Dataset instance (shared across folds)
 ds = AnnDataImageGraphDataset(
-    adata_224, adata_counts, adata_feats,
+    args.adata_224, args.adata_counts, args.adata_feats,
     args.tiff,
     'graph_outputs/embryo.pt',
     'embryo_data/spot_iou/embryo_iou_results_new_1.csv',
@@ -104,6 +100,8 @@ scaler = GradScaler() if args.fp16 else None
 
 metrics = {'mse':[], 'mae':[], 'pcc':[]}
 fold = 0
+best_pcc = -1.0
+best_fold = 0
 
 for train_slides, test_slides in kf.split(unique_slides):
     fold += 1
@@ -129,7 +127,7 @@ for train_slides, test_slides in kf.split(unique_slides):
     )
     test_loader = torch.utils.data.DataLoader(
         test_ds, batch_size=args.batch_size, shuffle=False,
-        collate_fn=lambda b: collate_fn_result(b, ds.spot_iou, ds.graph, False),
+        collate_fn=lambda b: collate_fn_result(b, ds.spot_iou, ds.graph, False, train_slides),
         num_workers=args.num_workers, pin_memory=True
     )
 
@@ -140,6 +138,7 @@ for train_slides, test_slides in kf.split(unique_slides):
 
     iter_num = 0
     max_epoch = 51
+    best_fold_pcc = -1.0
 
     for epoch in tqdm(range(1, max_epoch+1), desc=f"Fold {fold}"):
         model.train()
@@ -206,6 +205,18 @@ for train_slides, test_slides in kf.split(unique_slides):
                 break
         if iter_num >= args.max_iters:
             break
+        
+        # Save model after each epoch
+        torch.save({
+            'fold': fold,
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'iter_num': iter_num,
+            'loss': loss.item() if 'loss' in locals() else 0.0,
+            'args': args
+        }, os.path.join(save_path, f'model_fold{fold}_epoch{epoch}.pth'))
+        logging.info(f"Saved model after epoch {epoch}")
 
         # Evaluation every 10 epochs and last epoch
         if epoch % 10 == 0 or epoch == max_epoch:
@@ -241,13 +252,61 @@ for train_slides, test_slides in kf.split(unique_slides):
                     val_pcc  += calculate_pcc(pred[idxs], labels[idxs].to(device)).item() * len(indices)
                     total    += len(indices)
 
-            metrics['mse'].append(val_loss/total)
-            metrics['mae'].append(val_mae/total)
-            metrics['pcc'].append(val_pcc/total)
+            fold_mse = val_loss/total
+            fold_mae = val_mae/total
+            fold_pcc = val_pcc/total
+            
+            metrics['mse'].append(fold_mse)
+            metrics['mae'].append(fold_mae)
+            metrics['pcc'].append(fold_pcc)
+            
             logging.info(
-                f"VAL Fold{fold} E{epoch}: MSE={metrics['mse'][-1]:.4f}, " +
-                f"MAE={metrics['mae'][-1]:.4f}, PCC={metrics['pcc'][-1]:.4f}"
+                f"VAL Fold{fold} E{epoch}: MSE={fold_mse:.4f}, " +
+                f"MAE={fold_mae:.4f}, PCC={fold_pcc:.4f}"
             )
+            
+            # Save best model for this fold
+            if fold_pcc > best_fold_pcc:
+                best_fold_pcc = fold_pcc
+                torch.save({
+                    'fold': fold,
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'mse': fold_mse,
+                    'mae': fold_mae,
+                    'pcc': fold_pcc,
+                    'args': args
+                }, os.path.join(save_path, f'model_fold{fold}_best.pth'))
+                logging.info(f"Saved best model for fold {fold} with PCC: {fold_pcc:.4f}")
+
+    # Save final model for this fold
+    torch.save({
+        'fold': fold,
+        'epoch': max_epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'mse': metrics['mse'][-1],
+        'mae': metrics['mae'][-1],
+        'pcc': metrics['pcc'][-1],
+        'args': args
+    }, os.path.join(save_path, f'model_fold{fold}_final.pth'))
+    
+    # Track global best model
+    if metrics['pcc'][-1] > best_pcc:
+        best_pcc = metrics['pcc'][-1]
+        best_fold = fold
+        torch.save({
+            'fold': fold,
+            'epoch': max_epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'mse': metrics['mse'][-1],
+            'mae': metrics['mae'][-1],
+            'pcc': metrics['pcc'][-1],
+            'args': args
+        }, os.path.join(save_path, 'model_best_overall.pth'))
+        logging.info(f"Saved best overall model from fold {fold} with PCC: {best_pcc:.4f}")
 
     writer.close()
 
@@ -256,4 +315,4 @@ pd.DataFrame(metrics).to_excel(
     os.path.join(save_path,'crossval_metrics.xlsx'),
     index=False
 )
-logging.info("All done. Metrics saved.")
+logging.info(f"All done. Metrics saved. Best model from fold {best_fold} with PCC: {best_pcc:.4f}")

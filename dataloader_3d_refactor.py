@@ -7,6 +7,7 @@ import tifffile
 from torch.utils.data import Dataset
 from PIL import Image
 from tqdm import tqdm
+import scanpy as sc
 
 from models.graph_construction import (
     extract_submatrix_3D,
@@ -36,9 +37,9 @@ class AnnDataImageGraphDataset(Dataset):
     """
     def __init__(
         self,
-        adata_224,
-        adata_counts,
-        adata_features,
+        adata_224_path,
+        adata_counts_path,
+        adata_features_path,
         tiff_path: str,
         graph_path: str,
         spot_iou_path: str,
@@ -50,37 +51,33 @@ class AnnDataImageGraphDataset(Dataset):
         self.transform   = transform
         self.patch_size  = patch_size
 
-        # 1) load the TIFF volume (T,3,H,W) → (T,H,W,C)
-        
+        # 1) memory-map the TIFF volume (T,3,H,W) → (T,H,W,C)
         self.vol = tifffile.imread(tiff_path)
         if self.vol.ndim == 4 and self.vol.shape[1] in (1,3,4):
-            self.vol = np.moveaxis(self.vol, 1, -1)        
+            self.vol = np.moveaxis(self.vol, 1, -1)
 
-        # 2) keep the AnnData objects
-        self.adata_224      = adata_224
-        self.adata_counts   = adata_counts
-        self.adata_features = adata_features
+        # 2) open AnnData in backed mode
+        self.adata_224      = sc.read_h5ad(adata_224_path, backed='r')
+        self.adata_counts   = sc.read_h5ad(adata_counts_path, backed='r')
+        self.adata_features = sc.read_h5ad(adata_features_path, backed='r')
 
-        obs224 = adata_224.obs
+        obs224 = self.adata_224.obs
         # map sample names → TIFF slice index
         samples = list(obs224['sample'].astype(str).unique())
         self.sample_to_idx = {s:i for i,s in enumerate(samples)}
 
         # compute integer coords (scaled)
-        coords        = (adata_224.obsm['spatial'] * spatial_scale).astype(int)
+        coords        = (self.adata_224.obsm['spatial'] * spatial_scale).astype(int)
         self.x_coords = coords[:,0]
         self.y_coords = coords[:,1]
         self.sample_idxs = obs224['sample'].astype(str).map(self.sample_to_idx).to_numpy().astype(int)
-
-        # 3) 224‐resolution labels
-        self.labels_224 = adata_224.X.astype(np.float32)
 
         # 5) graph & adjacency CSV
         self.graph      = torch.load(graph_path, weights_only=False)
         self.spot_iou = pd.read_csv(spot_iou_path)
 
     def __len__(self):
-        return len(self.adata_224)
+        return self.adata_224.shape[0]
 
     def __getitem__(self, idx):
         # crop patch
@@ -95,13 +92,13 @@ class AnnDataImageGraphDataset(Dataset):
             img = self.transform(img)
 
         spot_id = self.adata_224.obs.iloc[idx]['spot_id']
+        # features for 224
         f224 = self.adata_features[self.adata_features.obs['spot_id']==spot_id].obsm['features']
         # gather labels & features
         c512 = self.adata_features[self.adata_features.obs['spot_id']==spot_id].obs['containing_512'].item()
         c1024= self.adata_features[self.adata_features.obs['spot_id']==spot_id].obs['containing_1024'].item()
         # pull counts from adata_counts.obs
-
-        l224 = self.labels_224[idx]
+        l224 = self.adata_224.X[idx]
         l512 = self.adata_counts[self.adata_counts.obs['spot_id']==c512].X
         l10  = self.adata_counts[self.adata_counts.obs['spot_id']==c1024].X
         f512 = self.adata_features[self.adata_features.obs['spot_id']==c512].obsm['features']
@@ -150,7 +147,7 @@ def collate_fn(batch, spot_iou, graph, is_weighted=False):
             positions, i10, i5, feat10, feat5,
             graph, known)
 
-def collate_fn_result(batch, spot_iou, graph, is_weighted=False):
+def collate_fn_result(batch, spot_iou, graph, is_weighted=False, train_slides=None):
     imgs, l224s, poss, idx10s, idx5s, f10s, f5s, f224s, spot_id, levels = zip(*batch)
     images    = torch.stack(imgs)
     labels    = torch.tensor(np.array(l224s))
@@ -162,8 +159,14 @@ def collate_fn_result(batch, spot_iou, graph, is_weighted=False):
     i10    = torch.tensor(idx10s)
     i5     = torch.tensor(idx5s)
 
-    indices      = [i for i, lvl in enumerate(levels) if lvl >  0]
-    indices_eval = [i for i, lvl in enumerate(levels) if lvl == 0]
+    # Set default train_slides if not provided (fallback to old behavior)
+    if train_slides is None:
+        indices      = [i for i, lvl in enumerate(levels) if lvl >  0]
+        indices_eval = [i for i, lvl in enumerate(levels) if lvl == 0]
+    else:
+        # New logic: indices_eval = training slides, indices = validation slides
+        indices_eval = [i for i, lvl in enumerate(levels) if lvl in train_slides]
+        indices      = [i for i, lvl in enumerate(levels) if lvl not in train_slides]
 
     idx_arr = np.array(spot_id)
     k       = min(idx_arr.shape[0]-1, 12)
@@ -217,7 +220,7 @@ def create_dataloaders_for_result(
     adata_224, adata_counts, adata_features,
     tiff_path, graph_path, spot_iou_path,
     spatial_scale=15.0,
-    batch_size=32, patch_size=224, transform=None
+    batch_size=32, patch_size=224, transform=None, train_slides=None
 ):
     ds = AnnDataImageGraphDataset(
         adata_224, adata_counts, adata_features,
@@ -239,7 +242,7 @@ def create_dataloaders_for_result(
             ds,
             batch_size=batch_size,
             shuffle=False,
-            collate_fn=lambda b: collate_fn_result(b, ds.spot_iou, ds.graph, False),
+            collate_fn=lambda b: collate_fn_result(b, ds.spot_iou, ds.graph, False, train_slides),
             num_workers=4,
             pin_memory=True
         )
