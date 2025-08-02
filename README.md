@@ -154,9 +154,9 @@ MSAGNet comprises cross-attention layers, GAT blocks, and Transformer layers to 
   CUDA_VISIBLE_DEVICES=0 python -m pdb  main_3d.py --root_path ../../3d-imputation-data/HER2_3D/ --base_lr 0.0001 --batch_size 256
   ```
   
-  ```bash
-  CUDA_VISIBLE_DEVICES=0 python -m pdb  main_3d_refactor.py --root_path ../../3d-imputation-data/HER2_3D/ --base_lr 0.0001 --batch_size 256 --adata_224 filtered_adata_norm.h5ad --adata_counts adata_counts_hierarchy_norm.h5ad --adata_feats adata_with_features.h5ad --tiff /nfs/team361/data/sanger_whole_embryo/aligned_downsampled_2_reg.ome.tif --spatial_scale 15s
-  ```
+```bash
+CUDA_VtfollahISIBLE_DEVICES=0 python -m pdb  main_3d_refactor.py --root_path ../../3d-imputation-data/HER2_3D/ --base_lr 0.0001 --batch_size 160 --adata_224 filtered_adata_norm.h5ad --adata_counts adata_counts_hierarchy_norm.h5ad --adata_feats adata_with_features.h5ad --tiff /nfs/team361/data/sanger_whole_embryo/aligned_downsampled_2_reg.ome.tif --spatial_scale 15 --fp16 --num_workers 0 --save_path embryo_results
+ ```
 ------
 
 ## Result

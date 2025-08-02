@@ -86,8 +86,8 @@ class AnnDataImageGraphDataset(Dataset):
         h = w = self.patch_size
         y0, x0 = y - h//2, x - w//2
 
-        patch = self.vol[si, y0:y0+h, x0:x0+w, :]
-        img   = Image.fromarray(patch)
+        img = self.vol[si, y0:y0+h, x0:x0+w, :]
+        img   = Image.fromarray(img)
         if self.transform:
             img = self.transform(img)
 

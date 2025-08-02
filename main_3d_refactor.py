@@ -113,10 +113,29 @@ for train_slides, test_slides in kf.split(unique_slides):
         i for i, s in enumerate(ds.sample_idxs)
         if s in train_slides
     ]
+    temp = np.concatenate((test_slides, train_slides[0:1]))
     test_idx = [
         i for i, s in enumerate(ds.sample_idxs)
-        if s in test_slides
+        if s in temp
     ]
+
+    # Save train/test split indices for this fold
+    split_info = {
+        'fold': fold,
+        'train_slides': train_slides.tolist(),
+        'test_slides': test_slides.tolist(),
+        'train_idx': train_idx,
+        'test_idx': test_idx,
+        'n_train_samples': len(train_idx),
+        'n_test_samples': len(test_idx)
+    }
+    
+    # Save split information as both pickle and npz
+    import pickle
+    with open(os.path.join(save_path, f'fold{fold}_split_info.pkl'), 'wb') as f:
+        pickle.dump(split_info, f)
+        
+    logging.info(f"Saved split indices for fold {fold}: {len(train_idx)} train, {len(test_idx)} test samples")
 
     train_ds = Subset(ds, train_idx)
     test_ds  = Subset(ds, test_idx)
@@ -127,7 +146,7 @@ for train_slides, test_slides in kf.split(unique_slides):
         num_workers=args.num_workers, pin_memory=True
     )
     test_loader = torch.utils.data.DataLoader(
-        test_ds, batch_size=args.batch_size, shuffle=False,
+        test_ds, batch_size=args.batch_size, shuffle=True,
         collate_fn=lambda b: collate_fn_result(b, ds.spot_iou, ds.graph, False, train_slides),
         num_workers=args.num_workers, pin_memory=True
     )
@@ -215,12 +234,13 @@ for train_slides, test_slides in kf.split(unique_slides):
             'optimizer_state_dict': optimizer.state_dict(),
             'iter_num': iter_num,
             'loss': loss.item() if 'loss' in locals() else 0.0,
-            'args': args
-        }, os.path.join(save_path, f'model_fold{fold}_epoch{epoch}.pth'))
+            'args': args,
+            'split_info': split_info
+        }, os.path.join(save_path, f'model_fold{fold}.pth'))
         logging.info(f"Saved model after epoch {epoch}")
 
         # Evaluation every 10 epochs and last epoch
-        if epoch % 1 == 0 or epoch == max_epoch:
+        if epoch % 5 == 0 or epoch == max_epoch:
             model.eval()
             val_loss = val_mae = val_pcc = total = 0
             with torch.no_grad():
@@ -283,7 +303,8 @@ for train_slides, test_slides in kf.split(unique_slides):
                     'mse': fold_mse,
                     'mae': fold_mae,
                     'pcc': fold_pcc,
-                    'args': args
+                    'args': args,
+                    'split_info': split_info
                 }, os.path.join(save_path, f'model_fold{fold}_best.pth'))
                 logging.info(f"Saved best model for fold {fold} with PCC: {fold_pcc:.4f}")
 
@@ -296,7 +317,8 @@ for train_slides, test_slides in kf.split(unique_slides):
         'mse': metrics['mse'][-1],
         'mae': metrics['mae'][-1],
         'pcc': metrics['pcc'][-1],
-        'args': args
+        'args': args,
+        'split_info': split_info
     }, os.path.join(save_path, f'model_fold{fold}_final.pth'))
     
     # Track global best model
@@ -311,7 +333,8 @@ for train_slides, test_slides in kf.split(unique_slides):
             'mse': metrics['mse'][-1],
             'mae': metrics['mae'][-1],
             'pcc': metrics['pcc'][-1],
-            'args': args
+            'args': args,
+            'split_info': split_info
         }, os.path.join(save_path, 'model_best_overall.pth'))
         logging.info(f"Saved best overall model from fold {fold} with PCC: {best_pcc:.4f}")
 
