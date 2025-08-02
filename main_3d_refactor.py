@@ -220,7 +220,6 @@ for train_slides, test_slides in kf.split(unique_slides):
             writer.add_scalar('lr', optimizer.param_groups[0]['lr'], iter_num)
             writer.add_scalar('loss', loss.item(), iter_num)
             logging.info(f"iter {iter_num} — loss {loss.item():.4f}")
-            break
             if iter_num >= args.max_iters:
                 break
         if iter_num >= args.max_iters:
