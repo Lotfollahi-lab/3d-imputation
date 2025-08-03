@@ -52,6 +52,7 @@ parser.add_argument('--patch_size',   type=int, default=224)
 parser.add_argument('--fp16', action='store_true', help='Enable mixed precision (fp16) training')
 parser.add_argument('--num_workers', type=int, default=10)
 parser.add_argument('--save_path', type=str, default='./weight/ours')
+parser.add_argument('--resume_checkpoint', type=str, default=None, help='Path to checkpoint to resume from')
 args = parser.parse_args()
 
 # Setup
@@ -59,6 +60,13 @@ os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 cudnn.benchmark = True
 random.seed(args.seed); torch.manual_seed(args.seed)
+
+# Load checkpoint if provided
+checkpoint = None
+if args.resume_checkpoint and os.path.exists(args.resume_checkpoint):
+    print(f"Loading checkpoint from {args.resume_checkpoint}")
+    checkpoint = torch.load(args.resume_checkpoint, map_location=device)
+    print(f"Resuming from fold {checkpoint['fold']}, epoch {checkpoint['epoch']}")
 
 # Instead, get unique slides from AnnData file (efficiently)
 adata_224_obs = ad.read_h5ad(args.adata_224, backed='r').obs
@@ -106,6 +114,11 @@ best_fold = 0
 
 for train_slides, test_slides in kf.split(unique_slides):
     fold += 1
+    
+    # Skip folds until we reach the checkpoint fold
+    if checkpoint and fold < checkpoint['fold']:
+        continue
+        
     logging.info(f"\n=== Fold {fold} ===")
 
     # determine obs‐indices for train/test
@@ -154,13 +167,36 @@ for train_slides, test_slides in kf.split(unique_slides):
     # Model & optimizer
     model     = ST_GTC_3d().to(device)
     optimizer = optim.SGD(model.parameters(), lr=args.base_lr, momentum=0.9)
+    
+    # Load checkpoint data if resuming this specific fold
+    if checkpoint:
+        logging.info("Loading model and optimizer state from checkpoint")
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if 'metrics' in checkpoint:
+            # Load any existing metrics
+            for key in metrics.keys():
+                if key in checkpoint.get('metrics', {}):
+                    metrics[key] = checkpoint['metrics'][key]
+        logging.info(f"Loaded checkpoint with PCC: {checkpoint.get('pcc', 'N/A')}")
+    
     writer    = SummaryWriter(os.path.join(save_path, f'fold{fold}'))
 
-    iter_num = 0
+    iter_num = checkpoint['iter_num'] if checkpoint else 0
     max_epoch = 51
     best_fold_pcc = -1.0
+    
+    # Start from resume_epoch if resuming this fold, otherwise start from epoch 1
+    start_epoch = checkpoint['epoch'] if checkpoint else 1
+    
+    # Store checkpoint info for this training loop
+    resume_iter = checkpoint['iter_num'] if checkpoint else 0
+    resume_epoch = checkpoint['epoch'] if checkpoint else 1
+    
+    # Reset checkpoint after using it
+    checkpoint = None
 
-    for epoch in tqdm(range(1, max_epoch+1), desc=f"Fold {fold}"):
+    for epoch in tqdm(range(start_epoch, max_epoch+1), desc=f"Fold {fold}"):
         model.train()
         for (
             images, labels, adj_sub, adj_prop,
@@ -168,6 +204,11 @@ for train_slides, test_slides in kf.split(unique_slides):
             features_1024, features_512,
             graph_torch, known_label
         ) in tqdm(train_loader, desc=f"Fold {fold} Epoch {epoch}"):
+            # Skip iterations if resuming from middle of epoch
+            if epoch == resume_epoch and iter_num < resume_iter:
+                iter_num += 1
+                continue
+
             # adjust LR
             for g in optimizer.param_groups:
                 g['lr'] = args.base_lr * (1 - iter_num/args.max_iters)**args.lr_decay
@@ -234,12 +275,13 @@ for train_slides, test_slides in kf.split(unique_slides):
             'iter_num': iter_num,
             'loss': loss.item() if 'loss' in locals() else 0.0,
             'args': args,
-            'split_info': split_info
-        }, os.path.join(save_path, f'model_fold{fold}.pth'))
+            'split_info': split_info,
+            'metrics': metrics
+        }, os.path.join(save_path, f'model_fold{fold}_epoch{epoch}.pth'))
         logging.info(f"Saved model after epoch {epoch}")
 
         # Evaluation every 10 epochs and last epoch
-        if epoch % 5 == 0 or epoch == max_epoch:
+        if epoch % 10 == 0 or epoch == max_epoch:
             model.eval()
             val_loss = val_mae = val_pcc = total = 0
             with torch.no_grad():
@@ -303,7 +345,9 @@ for train_slides, test_slides in kf.split(unique_slides):
                     'mae': fold_mae,
                     'pcc': fold_pcc,
                     'args': args,
-                    'split_info': split_info
+                    'split_info': split_info,
+                    'iter_num': iter_num,
+                    'metrics': metrics
                 }, os.path.join(save_path, f'model_fold{fold}_best.pth'))
                 logging.info(f"Saved best model for fold {fold} with PCC: {fold_pcc:.4f}")
 
@@ -313,15 +357,17 @@ for train_slides, test_slides in kf.split(unique_slides):
         'epoch': max_epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
-        'mse': metrics['mse'][-1],
-        'mae': metrics['mae'][-1],
-        'pcc': metrics['pcc'][-1],
+        'mse': metrics['mse'][-1] if metrics['mse'] else 0.0,
+        'mae': metrics['mae'][-1] if metrics['mae'] else 0.0,
+        'pcc': metrics['pcc'][-1] if metrics['pcc'] else 0.0,
         'args': args,
-        'split_info': split_info
+        'split_info': split_info,
+        'iter_num': iter_num,
+        'metrics': metrics
     }, os.path.join(save_path, f'model_fold{fold}_final.pth'))
     
     # Track global best model
-    if metrics['pcc'][-1] > best_pcc:
+    if metrics['pcc'] and metrics['pcc'][-1] > best_pcc:
         best_pcc = metrics['pcc'][-1]
         best_fold = fold
         torch.save({
@@ -333,7 +379,9 @@ for train_slides, test_slides in kf.split(unique_slides):
             'mae': metrics['mae'][-1],
             'pcc': metrics['pcc'][-1],
             'args': args,
-            'split_info': split_info
+            'split_info': split_info,
+            'iter_num': iter_num,
+            'metrics': metrics
         }, os.path.join(save_path, 'model_best_overall.pth'))
         logging.info(f"Saved best overall model from fold {fold} with PCC: {best_pcc:.4f}")
 
