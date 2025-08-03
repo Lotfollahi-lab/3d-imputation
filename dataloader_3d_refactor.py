@@ -90,7 +90,6 @@ class AnnDataImageGraphDataset(Dataset):
         img   = Image.fromarray(img)
         if self.transform:
             img = self.transform(img)
-
         spot_id = self.adata_224.obs.iloc[idx]['spot_id']
         # features for 224
         f224 = self.adata_features[self.adata_features.obs['spot_id']==spot_id].obsm['features']
@@ -118,7 +117,7 @@ class AnnDataImageGraphDataset(Dataset):
             spot_id, level
         )
 #section_029_AACTTGCTAACGGTTC-1'
-def collate_fn(batch, spot_iou, graph, is_weighted=False):
+def collate_fn(batch, spot_iou, is_weighted=False):
     imgs, l224s, poss, idx10s, idx5s, f10s, f5s, f224s, spot_id, levels = zip(*batch)
     images    = torch.stack(imgs)
     labels    = torch.tensor(np.array(l224s))
@@ -142,12 +141,11 @@ def collate_fn(batch, spot_iou, graph, is_weighted=False):
     if is_weighted:
         prop = adj_sub * (subM + 1).detach().clone()       # good
 
-
     return (images, labels, adj_sub, prop,
             positions, i10, i5, feat10, feat5,
-            graph, known)
+            known)
 
-def collate_fn_result(batch, spot_iou, graph, is_weighted=False, train_slides=None):
+def collate_fn_result(batch, spot_iou, is_weighted=False, train_slides=None):
     imgs, l224s, poss, idx10s, idx5s, f10s, f5s, f224s, spot_id, levels = zip(*batch)
     images    = torch.stack(imgs)
     labels    = torch.tensor(np.array(l224s))
@@ -190,7 +188,7 @@ def collate_fn_result(batch, spot_iou, graph, is_weighted=False, train_slides=No
 
     return (images, eval_, adj_sub, prop,
             positions, i10, i5, feat10, feat5,
-            graph, known, indices, torch.tensor(levels))
+            known, indices, torch.tensor(levels))
 
 def create_dataloaders_for_train(
     adata_224, adata_counts, adata_features,
@@ -210,7 +208,7 @@ def create_dataloaders_for_train(
             ds,
             batch_size=batch_size,
             shuffle=True,
-            collate_fn=lambda b: collate_fn(b, ds.spot_iou, ds.graph, True),
+            collate_fn=lambda b: collate_fn(b, ds.spot_iou, True),
             num_workers=4,
             pin_memory=True
         )
@@ -234,7 +232,7 @@ def create_dataloaders_for_result(
             ds,
             batch_size=batch_size,
             shuffle=True,
-            collate_fn=lambda b: collate_fn(b, ds.spot_iou, ds.graph, False),
+            collate_fn=lambda b: collate_fn(b, ds.spot_iou, False),
             num_workers=4,
             pin_memory=True
         ),
@@ -242,7 +240,7 @@ def create_dataloaders_for_result(
             ds,
             batch_size=batch_size,
             shuffle=True,
-            collate_fn=lambda b: collate_fn_result(b, ds.spot_iou, ds.graph, False, train_slides),
+            collate_fn=lambda b: collate_fn_result(b, ds.spot_iou, False, train_slides),
             num_workers=4,
             pin_memory=True
         )

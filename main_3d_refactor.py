@@ -152,15 +152,15 @@ for train_slides, test_slides in kf.split(unique_slides):
 
     train_ds = Subset(ds, train_idx)
     test_ds  = Subset(ds, test_idx)
-
+    graph_torch = torch.load('graph_outputs/embryo.pt', weights_only=False)
     train_loader = torch.utils.data.DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
-        collate_fn=lambda b: collate_fn(b, ds.spot_iou, ds.graph, True),
+        collate_fn=lambda b: collate_fn(b, ds.spot_iou, True),
         num_workers=args.num_workers, pin_memory=True
     )
     test_loader = torch.utils.data.DataLoader(
         test_ds, batch_size=args.batch_size, shuffle=True,
-        collate_fn=lambda b: collate_fn_result(b, ds.spot_iou, ds.graph, False, train_slides),
+        collate_fn=lambda b: collate_fn_result(b, ds.spot_iou, False, train_slides),
         num_workers=args.num_workers, pin_memory=True
     )
 
@@ -202,7 +202,7 @@ for train_slides, test_slides in kf.split(unique_slides):
             images, labels, adj_sub, adj_prop,
             positions, idx_1024, idx_512,
             features_1024, features_512,
-            graph_torch, known_label
+            known_label
         ) in tqdm(train_loader, desc=f"Fold {fold} Epoch {epoch}"):
             # Skip iterations if resuming from middle of epoch
             if epoch == resume_epoch and iter_num < resume_iter:
@@ -289,7 +289,7 @@ for train_slides, test_slides in kf.split(unique_slides):
                     images, labels, adj_sub, adj_prop,
                     positions, idx_1024, idx_512,
                     features_1024, features_512,
-                    graph_torch, known_label, indices, levels
+                    known_label, indices, levels
                 ) in test_loader:
                     g512  = graph_torch['layer_512']
                     g1024 = graph_torch['layer_1024']
