@@ -152,8 +152,8 @@ def collate_fn_result(batch, spot_iou, is_weighted=False, train_slides=None):
     positions = torch.tensor(np.array(poss))
     f224 = torch.tensor(np.array(f224s).squeeze(1))
 
-    feat10 = torch.tensor(f10s)
-    feat5  = torch.tensor(f5s)
+    feat10 = torch.tensor(np.array(f10s).squeeze(1))
+    feat5  = torch.tensor(np.array(f5s).squeeze(1))
     i10    = torch.tensor(idx10s)
     i5     = torch.tensor(idx5s)
 

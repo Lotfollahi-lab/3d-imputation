@@ -2,6 +2,12 @@
 """
 Inference script for 3D imputation model.
 Loads a trained checkpoint and runs inference on the test set.
+
+Features:
+- Configurable number of training slides to add to test set for imputation assistance
+- Reproduces the same train/test split as used during training
+- Saves detailed results including per-spot metrics
+- Supports both CPU and GPU inference
 """
 
 import os
@@ -33,7 +39,7 @@ from dataloader_3d_refactor import (
 def load_checkpoint_and_args(checkpoint_path: str) -> Tuple[Dict, argparse.Namespace, Dict]:
     """Load checkpoint and extract model state, args, and split info."""
     print(f"Loading checkpoint from {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     
     # Extract necessary components
     model_state_dict = checkpoint['model_state_dict']
@@ -46,8 +52,15 @@ def load_checkpoint_and_args(checkpoint_path: str) -> Tuple[Dict, argparse.Names
     
     return checkpoint, args, split_info
 
-def create_test_dataset_and_loader(args: argparse.Namespace, split_info: Dict, device: torch.device):
-    """Recreate the test dataset and dataloader using split info."""
+def create_test_dataset_and_loader(args: argparse.Namespace, split_info: Dict, device: torch.device, k_train_slides: int = 1):
+    """Recreate the test dataset and dataloader using split info.
+    
+    Args:
+        args: Training arguments
+        split_info: Split information from checkpoint
+        device: PyTorch device
+        k_train_slides: Number of random training slides to add to test set for imputation assistance
+    """
     
     # Create dataset with same parameters as training
     ds = AnnDataImageGraphDataset(
@@ -64,19 +77,49 @@ def create_test_dataset_and_loader(args: argparse.Namespace, split_info: Dict, d
     )
     
     # Use the saved test indices
-    test_idx = split_info['test_idx']
+    test_slides = np.array(split_info['test_slides'])
     train_slides = np.array(split_info['train_slides'])
     
-    print(f"Test set size: {len(test_idx)} samples")
-    print(f"Test slides: {split_info['test_slides']}")
+    print(f"Original test slides: {test_slides}")
+    print(f"Available train slides: {train_slides}")
     
+    # Randomly select k training slides to add to test set for imputation assistance
+    if k_train_slides > 0 and len(train_slides) > 0:
+        if k_train_slides > len(train_slides):
+            print(f"Warning: Requested {k_train_slides} training slides but only {len(train_slides)} available. Using all {len(train_slides)} slides.")
+            k_actual = len(train_slides)
+        else:
+            k_actual = k_train_slides
+            
+        np.random.seed(42)  # For reproducibility
+        selected_train_slides = np.random.choice(train_slides, size=k_actual, replace=False)
+        print(f"Adding {k_actual} random training slides to test set: {selected_train_slides}")
+        
+        # Combine test slides with selected training slides
+        temp = np.concatenate((test_slides, selected_train_slides))
+    elif k_train_slides == 0:
+        temp = test_slides
+        print("k_train_slides=0: No training slides added to test set")
+    else:
+        temp = test_slides
+        print("No training slides available or k_train_slides < 0: No training slides added to test set")
+    
+    # Recreate test indices based on the combined slide list
+    test_idx = [
+        i for i, s in enumerate(ds.sample_idxs)
+        if s in temp
+    ]
+
+    print(f"Test set size: {len(test_idx)} samples")
+    print(f"Final test slides: {temp}")
+
     test_ds = Subset(ds, test_idx)
     
     # Create test dataloader
     test_loader = torch.utils.data.DataLoader(
         test_ds, 
         batch_size=args.batch_size, 
-        shuffle=False,  # Don't shuffle for inference
+        shuffle=True,  # Don't shuffle for inference
         collate_fn=lambda b: collate_fn_result(b, ds.spot_iou, False, train_slides),
         num_workers=getattr(args, 'num_workers', 4), 
         pin_memory=True
@@ -285,8 +328,14 @@ def save_results_to_anndata(
     
     return results_adata
 
-def inference_main(checkpoint_path: str, output_path: str = None):
-    """Main inference function."""
+def inference_main(checkpoint_path: str, output_path: str = None, k_train_slides: int = 1):
+    """Main inference function.
+    
+    Args:
+        checkpoint_path: Path to the trained model checkpoint
+        output_path: Output path for results (optional)
+        k_train_slides: Number of random training slides to add to test set for imputation assistance
+    """
     
     # Load checkpoint and extract information
     checkpoint, args, split_info = load_checkpoint_and_args(checkpoint_path)
@@ -296,12 +345,17 @@ def inference_main(checkpoint_path: str, output_path: str = None):
     print(f"Using device: {device}")
     
     # Create test dataset and loader
-    ds, test_ds, test_loader, test_idx = create_test_dataset_and_loader(args, split_info, device)
+    ds, test_ds, test_loader, test_idx = create_test_dataset_and_loader(args, split_info, device, k_train_slides)
     
     # Initialize and load model
     print("Loading model...")
     model = ST_GTC_3d().to(device)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    try:
+        model.load_state_dict(checkpoint['model_state_dict'])
+    except Exception as e:
+        print(f"\n[ERROR] Failed to load model weights from checkpoint: {e}\n")
+        print("Please check that the checkpoint file is correct and matches the model architecture.")
+        raise
     
     # Run inference
     predictions, true_labels, spot_ids, original_indices = run_inference(model, test_loader, device, args, test_ds)
@@ -346,11 +400,20 @@ if __name__ == "__main__":
                        help='Path to the trained model checkpoint')
     parser.add_argument('--output', type=str, default=None,
                        help='Output path for results (default: auto-generated)')
+    parser.add_argument('--k_train_slides', type=int, default=1,
+                       help='Number of random training slides to add to test set for imputation assistance (default: 1, set to 0 to use only test slides)')
     
     args = parser.parse_args()
     
+    # Validate arguments
+    if args.k_train_slides < 0:
+        print("Error: k_train_slides must be non-negative")
+        sys.exit(1)
+    
+    print(f"Running inference with k_train_slides={args.k_train_slides}")
+    
     # Run inference
-    results = inference_main(args.checkpoint, args.output)
+    results = inference_main(args.checkpoint, args.output, args.k_train_slides)
     
     print("\n=== Inference Complete ===")
     print(f"Results saved to: {results['output_path']}") 
