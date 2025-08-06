@@ -105,6 +105,7 @@ def create_test_dataset_and_loader(args: argparse.Namespace, split_info: Dict, d
         print("No training slides available or k_train_slides < 0: No training slides added to test set")
     
     # Recreate test indices based on the combined slide list
+    temp = np.concatenate((test_slides, train_slides[0:1]))
     test_idx = [
         i for i, s in enumerate(ds.sample_idxs)
         if s in temp
@@ -121,7 +122,8 @@ def create_test_dataset_and_loader(args: argparse.Namespace, split_info: Dict, d
         batch_size=args.batch_size, 
         shuffle=True,  # Don't shuffle for inference
         collate_fn=lambda b: collate_fn_result(b, ds.spot_iou, False, train_slides),
-        num_workers=getattr(args, 'num_workers', 4), 
+        #num_workers=getattr(args, 'num_workers', 4), 
+        num_workers=0,
         pin_memory=True
     )
     
@@ -133,7 +135,7 @@ def run_inference(model: nn.Module, test_loader, device: torch.device, args: arg
     
     all_predictions = []
     all_true_labels = []
-    all_test_indices = []
+    all_original_indices = []  # Changed to track original dataset indices directly
     
     # Load graph data (same as in training)
     graph_torch = torch.load('graph_outputs/embryo.pt', weights_only=False)
@@ -144,7 +146,7 @@ def run_inference(model: nn.Module, test_loader, device: torch.device, args: arg
             images, labels, adj_sub, adj_prop,
             positions, idx_1024, idx_512,
             features_1024, features_512,
-            known_label, indices, levels
+            known_label, indices, levels, test_orig_indices  # Now gets original indices as extra field
         ) in enumerate(tqdm(test_loader, desc="Inference")):
             
             # Prepare batch data (same as training)
@@ -170,14 +172,17 @@ def run_inference(model: nn.Module, test_loader, device: torch.device, args: arg
                 pred, _, _ = model(*batch_data)
             
             # Extract predictions for test indices only
-            test_indices = torch.tensor(indices)
-            if len(test_indices) > 0:
-                batch_predictions = pred.cpu()[test_indices].numpy()
-                batch_true_labels = labels[test_indices].numpy()
+            if len(test_orig_indices) > 0 and len(indices) > 0:
+                # indices: batch positions of test spots
+                # test_orig_indices: original dataset indices for test spots
+                batch_test_positions = torch.tensor(indices)
+                
+                batch_predictions = pred.cpu()[batch_test_positions].numpy()
+                batch_true_labels = labels[batch_test_positions].numpy()
                 
                 all_predictions.append(batch_predictions)
                 all_true_labels.append(batch_true_labels)
-                all_test_indices.extend(indices)
+                all_original_indices.extend(test_orig_indices)
     
     # Concatenate all results
     if all_predictions:
@@ -187,38 +192,23 @@ def run_inference(model: nn.Module, test_loader, device: torch.device, args: arg
         all_predictions = np.array([]).reshape(0, -1)
         all_true_labels = np.array([]).reshape(0, -1)
     
-    # Get spot_ids for the predicted samples
-    # We need to map back from batch indices to original dataset indices
-    original_indices = []
+    # Get spot_ids using the original indices directly
     spot_ids = []
     
-    if hasattr(test_ds, 'indices'):  # It's a Subset
-        dataset = test_ds.dataset
-        subset_indices = test_ds.indices
-        
-        for batch_test_idx in all_test_indices:
-            # Map from batch index back to original dataset index
-            if batch_test_idx < len(subset_indices):
-                original_idx = subset_indices[batch_test_idx]
-                original_indices.append(original_idx)
-                
-                # Get spot_id from the original dataset
-                if hasattr(dataset, 'adata_224'):
-                    spot_id = dataset.adata_224.obs.iloc[original_idx]['spot_id']
-                    spot_ids.append(spot_id)
-                else:
-                    spot_ids.append(f"unknown_{original_idx}")
+    # Access the original dataset (not the Subset)
+    if hasattr(test_ds, 'dataset'):  # It's a Subset
+        original_dataset = test_ds.dataset
     else:
-        # Direct dataset access
-        for batch_test_idx in all_test_indices:
-            original_indices.append(batch_test_idx)
-            if hasattr(test_ds, 'adata_224'):
-                spot_id = test_ds.adata_224.obs.iloc[batch_test_idx]['spot_id']
-                spot_ids.append(spot_id)
-            else:
-                spot_ids.append(f"unknown_{batch_test_idx}")
+        original_dataset = test_ds
     
-    return all_predictions, all_true_labels, spot_ids, original_indices
+    for original_idx in all_original_indices:
+        if hasattr(original_dataset, 'adata_224'):
+            spot_id = original_dataset.adata_224.obs.iloc[original_idx]['spot_id']
+            spot_ids.append(spot_id)
+        else:
+            spot_ids.append(f"unknown_{original_idx}")
+    
+    return all_predictions, all_true_labels, spot_ids, all_original_indices
 
 def compute_metrics(predictions: np.ndarray, true_labels: np.ndarray) -> Dict[str, float]:
     """Compute evaluation metrics."""

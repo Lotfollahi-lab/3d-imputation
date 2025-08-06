@@ -289,7 +289,7 @@ for train_slides, test_slides in kf.split(unique_slides):
                     images, labels, adj_sub, adj_prop,
                     positions, idx_1024, idx_512,
                     features_1024, features_512,
-                    known_label, indices, levels
+                    known_label, indices, levels, test_orig_indices
                 ) in test_loader:
                     g512  = graph_torch['layer_512']
                     g1024 = graph_torch['layer_1024']

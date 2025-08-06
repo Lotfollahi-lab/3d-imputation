@@ -114,11 +114,11 @@ class AnnDataImageGraphDataset(Dataset):
             img, l224, (x,y),
             idx_1024, idx_512,
             f10, f512, f224,
-            spot_id, level
+            spot_id, level, idx  # Add original dataset index
         )
 #section_029_AACTTGCTAACGGTTC-1'
 def collate_fn(batch, spot_iou, is_weighted=False):
-    imgs, l224s, poss, idx10s, idx5s, f10s, f5s, f224s, spot_id, levels = zip(*batch)
+    imgs, l224s, poss, idx10s, idx5s, f10s, f5s, f224s, spot_id, levels, orig_indices = zip(*batch)
     images    = torch.stack(imgs)
     labels    = torch.tensor(np.array(l224s))
     positions = torch.tensor(np.array(poss))
@@ -146,7 +146,7 @@ def collate_fn(batch, spot_iou, is_weighted=False):
             known)
 
 def collate_fn_result(batch, spot_iou, is_weighted=False, train_slides=None):
-    imgs, l224s, poss, idx10s, idx5s, f10s, f5s, f224s, spot_id, levels = zip(*batch)
+    imgs, l224s, poss, idx10s, idx5s, f10s, f5s, f224s, spot_id, levels, orig_indices = zip(*batch)
     images    = torch.stack(imgs)
     labels    = torch.tensor(np.array(l224s))
     positions = torch.tensor(np.array(poss))
@@ -186,9 +186,18 @@ def collate_fn_result(batch, spot_iou, is_weighted=False, train_slides=None):
     if is_weighted:
         prop = adj_sub * (subM + 1).detach().clone()       # good
 
+    # Return original dataset indices for the test spots (not training spots)
+    test_orig_indices = [orig_indices[i] for i in indices]
+
+    # For backward compatibility with training script:
+    # - indices: batch positions of test spots (used by training script)
+    # - For inference, we'll extract test_orig_indices separately via a special attribute
+    
+    # Store original indices in the batch for inference use
+    # We'll add this as an extra field that inference can access
     return (images, eval_, adj_sub, prop,
             positions, i10, i5, feat10, feat5,
-            known, indices, torch.tensor(levels))
+            known, indices, torch.tensor(levels), test_orig_indices)
 
 def create_dataloaders_for_train(
     adata_224, adata_counts, adata_features,
