@@ -121,6 +121,9 @@ def collate_fn(batch, adj_matrix, graph, is_weighted=False):
     idx_512 = torch.tensor(idx_512_list)
 
     known_label = retain_random_rows(labels, retain_ratio=0.2)
+    print(known_label)
+    print(known_label.shape)
+    print(type(known_label))
 
     adj_propagate = torch.tensor(0)
     if is_weighted:

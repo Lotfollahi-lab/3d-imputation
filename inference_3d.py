@@ -122,8 +122,7 @@ def create_test_dataset_and_loader(args: argparse.Namespace, split_info: Dict, d
         batch_size=args.batch_size, 
         shuffle=True,  # Don't shuffle for inference
         collate_fn=lambda b: collate_fn_result(b, ds.spot_iou, False, train_slides),
-        #num_workers=getattr(args, 'num_workers', 4), 
-        num_workers=0,
+        num_workers=getattr(args, 'num_workers', 4), 
         pin_memory=True
     )
     
