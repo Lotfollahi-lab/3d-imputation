@@ -163,7 +163,7 @@ if __name__ == "__main__":
 
             file_names = list(train_dataloaders.keys())
             random.shuffle(file_names)
-
+        
             for file_name in file_names:
                 tmp_loader = train_dataloaders[file_name]
 
@@ -174,6 +174,7 @@ if __name__ == "__main__":
                 tmp_name = file_name.split('/')[-1][:-4]
 
                 for images, labels, adj_sub, adj_propagate, positions, idx_1024, idx_512, features_1024, features_512, graph_torch, known_label in tmp_loader:
+                    
                     graph_512 = graph_torch['layer_512']
                     graph_1024 = graph_torch['layer_1024']
 
@@ -214,7 +215,7 @@ if __name__ == "__main__":
                     time1 = time.time()
                     break
 
-            if epoch_num % 10 == 0:
+            if epoch_num % 1 == 0:
                 model.eval()
                 with torch.no_grad():
                     for file_name, tmp_loader in test_dataloader.items():
@@ -246,7 +247,7 @@ if __name__ == "__main__":
                             val_pcc += calculate_pcc(pred[indices], labels[indices].cuda()) * len(indices)
                             print(f'mse {loss}, pcc {calculate_pcc(pred[indices], labels[indices].cuda())}')
 
-            if (epoch_num+1) % max_epoch == 0:
+            if (epoch_num+10) % max_epoch == 0:
                 model.eval()
                 with torch.no_grad():
                     for file_name, tmp_loader in test_dataloader.items():

@@ -147,6 +147,8 @@ def run_inference(model: nn.Module, test_loader, device: torch.device, args: arg
             features_1024, features_512,
             known_label, indices, levels, test_orig_indices  # Now gets original indices as extra field
         ) in enumerate(tqdm(test_loader, desc="Inference")):
+            if batch_idx > 10:
+                break
             
             # Prepare batch data (same as training)
             g512 = graph_torch['layer_512']
@@ -245,10 +247,6 @@ def save_results_to_anndata(
     adata_224 = ad.read_h5ad(args.adata_224)
     
     if len(predictions) > 0 and len(spot_ids) > 0:
-        # Create AnnData object from predictions
-        # Use the original indices to maintain proper mapping
-        predicted_spots = [adata_224.obs.iloc[idx]['spot_id'] for idx in original_indices]
-        
         # Create new AnnData with predictions
         results_adata = ad.AnnData(
             X=predictions,
