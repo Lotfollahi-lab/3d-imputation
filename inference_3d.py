@@ -146,10 +146,7 @@ def run_inference(model: nn.Module, test_loader, device: torch.device, args: arg
             positions, idx_1024, idx_512,
             features_1024, features_512,
             known_label, indices, levels, test_orig_indices  # Now gets original indices as extra field
-        ) in enumerate(tqdm(test_loader, desc="Inference")):
-            if batch_idx > 10:
-                break
-            
+        ) in enumerate(tqdm(test_loader, desc="Inference")):            
             # Prepare batch data (same as training)
             g512 = graph_torch['layer_512']
             g1024 = graph_torch['layer_1024']
@@ -257,10 +254,30 @@ def save_results_to_anndata(
                 'true_mean': np.nanmean(true_labels, axis=1),
                 'prediction_std': np.nanstd(predictions, axis=1),
                 'is_predicted': True,
-                'inference_timestamp': pd.Timestamp.now()
             }),
             var=adata_224.var.copy()
         )
+        
+        # Ensure obs index matches spot_ids for Squidpy compatibility
+        try:
+            results_adata.obs.index = pd.Index(spot_ids, name='spot_id')
+        except Exception:
+            pass
+        
+        # Propagate spatial metadata for Squidpy (Visium-like structure)
+        if isinstance(getattr(adata_224, 'uns', None), dict) and 'spatial' in adata_224.uns:
+            results_adata.uns['spatial'] = adata_224.uns['spatial']
+            # Set library_id column expected by Squidpy/Scanpy (use sample if present)
+            if 'sample' in results_adata.obs.columns:
+                results_adata.obs['library_id'] = results_adata.obs['sample'].astype(str)
+            else:
+                # Fallback: if only one library exists in uns['spatial'], use that key
+                try:
+                    lib_keys = list(results_adata.uns['spatial'].keys())
+                    if len(lib_keys) == 1:
+                        results_adata.obs['library_id'] = lib_keys[0]
+                except Exception:
+                    pass
         
         # Add true expression data
         results_adata.obsm['true_expression'] = true_labels
@@ -278,7 +295,7 @@ def save_results_to_anndata(
             spatial_coords = []
             for orig_idx in original_indices:
                 spatial_coords.append(adata_224.obsm['spatial'][orig_idx])
-            results_adata.obsm['spatial'] = np.array(spatial_coords)
+            results_adata.obsm['spatial'] = np.asarray(spatial_coords, dtype=float)
         
         # Add metrics per spot
         if len(predictions) == len(true_labels):
