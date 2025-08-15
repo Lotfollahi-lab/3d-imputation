@@ -105,7 +105,7 @@ def create_test_dataset_and_loader(args: argparse.Namespace, split_info: Dict, d
         print("No training slides available or k_train_slides < 0: No training slides added to test set")
     
     # Recreate test indices based on the combined slide list
-    temp = np.concatenate((test_slides, train_slides[0:1]))
+    temp = np.concatenate((test_slides, train_slides[0:]))
     test_idx = [
         i for i, s in enumerate(ds.sample_idxs)
         if s in temp
