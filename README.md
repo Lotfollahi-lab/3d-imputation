@@ -15,6 +15,10 @@ In a stack of serial sections, H&E images are usually available for every sectio
 | Global set attention (GSA) | Slide-wide context through m inducing tokens, O(N·m) | `--use_inducing --n_inducing 64` |
 | Learned ZINB prior ψ_η | Start distribution of the flow, predicted from the counts of the matched spot on the closest profiled section | `--prior_sampler learned_zinb --phi_e_ckpt …` |
 
+<p align="center"><img src="docs/holotea_zstack.png" alt="HoloTea on a serial-section stack" width="65%"></p>
+
+*HoloTea leverages spatial neighborhood information from adjacent sections to improve 3D consistency in H&E to ST imputation.*
+
 ## Installation
 
 ```bash
