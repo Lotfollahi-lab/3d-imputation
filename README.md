@@ -2,6 +2,8 @@
 
 **3D-Guided Scalable Flow Matching for Generating Volumetric Tissue Spatial Transcriptomics from Serial Histology** (MLCB 2026)
 
+Paper: [PDF (main text + supplement)](paper/HoloTea_MLCB2026.pdf) · Preprint: [arXiv:2511.14613](https://arxiv.org/abs/2511.14613)
+
 ![HoloTea method overview](docs/holotea_overview.png)
 
 *Method overview. For each query spot on section z, HoloTea takes the nearest spot by position on sections z±1 as adjacent tokens and uses a ControlNet to condition the flow-matching denoiser with ZINB-based priors.*
