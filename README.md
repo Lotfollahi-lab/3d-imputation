@@ -2,6 +2,10 @@
 
 **3D-Guided Scalable Flow Matching for Generating Volumetric Tissue Spatial Transcriptomics from Serial Histology** (MLCB 2026)
 
+![HoloTea method overview](docs/holotea_overview.png)
+
+*Method overview. For each query spot on section z, HoloTea takes the nearest spot by position on sections z±1 as adjacent tokens and uses a ControlNet to condition the flow-matching denoiser with ZINB-based priors.*
+
 In a stack of serial sections, H&E images are usually available for every section, but spatial transcriptomics (ST) only for some of them. HoloTea imputes spot-level gene expression for the sections without ST, from their H&E images and the ST of the profiled sections next to them. It is a flow-matching model built on [STFlow](https://github.com/Graph-and-Geometric-Learning/STFlow). On top of STFlow it adds:
 
 | Component | What it does | Flag |
