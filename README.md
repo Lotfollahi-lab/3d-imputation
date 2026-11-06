@@ -18,8 +18,8 @@ In a stack of serial sections, H&E images are usually available for every sectio
 ## Installation
 
 ```bash
-git clone https://github.com/Lotfollahi-lab/3d-imputation.git
-cd 3d-imputation
+git clone https://github.com/Lotfollahi-lab/HoloTea.git
+cd HoloTea
 python -m venv .venv && source .venv/bin/activate     # Python 3.10
 pip install torch torchvision                          # build matching your CUDA version
 pip install -r requirements.txt
